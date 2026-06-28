@@ -603,6 +603,18 @@ class BashOutput(BaseModel):
         default=None,
         description="Path to temp file containing the full untruncated output.",
     )
+    stdout: Optional[str] = Field(
+        default=None,
+        description="Stdout only (when combine_output=False). None if streams are merged.",
+    )
+    stderr: Optional[str] = Field(
+        default=None,
+        description="Stderr only (when combine_output=False). None if streams are merged.",
+    )
+    stderr_truncated: bool = Field(
+        default=False,
+        description="True if stderr exceeded the 1MB safety limit (when combine_output=False).",
+    )
 
     def to_model_output(self) -> List[dict]:
         """
@@ -684,6 +696,9 @@ class BashOutput(BaseModel):
             "warnings": self.warnings,
             "summary": self._summary_line(),
             "output_file": self.output_file,
+            "stdout": self.stdout,
+            "stderr": self.stderr,
+            "stderr_truncated": self.stderr_truncated,
         }
 
     def _outcome(self) -> Outcome:
@@ -761,13 +776,18 @@ class CommandResult:
 
     command: str
     exit_code: Optional[int]  # None on timeout
-    output: str  # combined stdout + stderr (UTF-8)
+    output: str  # combined stdout + stderr (UTF-8), or stdout only when combine_output=False
     truncated: bool  # output hit the 1 MB cap
     timed_out: bool
     cwd: str  # the directory the command ran in
     warnings: List[str] = field(default_factory=list)
     denied: bool = False
     output_file: Optional[str] = None
+    stdout: Optional[str] = None  # stdout only (when combine_output=False)
+    stderr: Optional[str] = None  # stderr only (when combine_output=False)
+    stderr_truncated: bool = (
+        False  # stderr hit the 1 MB cap (when combine_output=False)
+    )
 
     def to_bash_output(self) -> BashOutput:
         """Convert to the Pydantic Output model for LLM consumption."""
@@ -778,6 +798,9 @@ class CommandResult:
             output=self.output,
             warnings=self.warnings,
             output_file=self.output_file,
+            stdout=self.stdout,
+            stderr=self.stderr,
+            stderr_truncated=self.stderr_truncated,
         )
 
     def to_dict(self) -> dict:
@@ -847,6 +870,9 @@ class PermissionManager:
         # Exact commands allowed for the session (case-sensitive).
         # We also store "prefix*" patterns for wildcard session allows.
         self._session_allows: Set[str] = set()
+        # External directories allowed for the session (canonical paths).
+        # Checked before prompting in request_external_directory().
+        self._session_ext_allows: Set[str] = set()
         # Track recent denials for consecutive-denial detection.
         # Each entry is (exact_command, base_command).
         self._denial_history: List[Tuple[str, str]] = []
@@ -901,12 +927,22 @@ class PermissionManager:
         Prompt the user for permission to access a directory outside the workspace.
 
         Mirrors OpenCode's externalDirectoryPermission flow:
-          - Always asks (no session-cache for external dirs)
+          - Checks session-cache first (no re-prompt for approved dirs)
           - Shows the directory path and context
-          - Returns ALLOW_ONCE or DENY
+          - 3 options: allow once, allow for session, deny
+          - Session-cached dirs are stored in _session_ext_allows
         """
         if self.config.auto_approve:
             return PermissionDecision.ALLOW_ONCE
+
+        # Check session cache — if this directory was already approved, skip prompt
+        canonical = str(Path(directory).resolve())
+        with self._lock:
+            if canonical in self._session_ext_allows:
+                print(
+                    f"  {DIM}[permission] session-allowed external dir: {directory[:60]}{RESET}"
+                )
+                return PermissionDecision.ALLOW_ONCE
 
         truncated_dir = directory if len(directory) <= 72 else directory[:69] + "..."
 
@@ -918,12 +954,15 @@ class PermissionManager:
         print(f"  {BOLD}Warning   :{RESET} This path is OUTSIDE the workspace.")
         print(SEP)
         print(f"  {BOLD}[1]{RESET}  Allow this time")
-        print(f"  {BOLD}[2]{RESET}  Deny")
+        print(
+            f"  {BOLD}[2]{RESET}  Allow for session (all commands referencing this dir)"
+        )
+        print(f"  {BOLD}[3]{RESET}  Deny")
         print(SEP)
 
         while True:
             try:
-                choice = input("  Your choice [1/2]: ").strip()
+                choice = input("  Your choice [1/2/3]: ").strip()
             except (EOFError, KeyboardInterrupt):
                 print(f"\n  {RED}✗ Denied (interrupted){RESET}\n{SEP}\n")
                 return PermissionDecision.DENY
@@ -932,10 +971,17 @@ class PermissionManager:
                 print(f"  {GREEN}✓ Allowed (once){RESET}\n{SEP}\n")
                 return PermissionDecision.ALLOW_ONCE
             elif choice == "2":
+                print(
+                    f"  {GREEN}✓ Allowed (session — all commands to {truncated_dir}){RESET}\n{SEP}\n"
+                )
+                with self._lock:
+                    self._session_ext_allows.add(canonical)
+                return PermissionDecision.ALLOW_SESSION
+            elif choice == "3":
                 print(f"  {RED}✗ Denied{RESET}\n{SEP}\n")
                 return PermissionDecision.DENY
             else:
-                print("  Please enter 1 or 2.")
+                print("  Please enter 1, 2, or 3.")
 
     def add_session_allow(self, command: str) -> None:
         """Programmatically add a session-wide allow (e.g. from CLI flags)."""
@@ -1175,6 +1221,72 @@ def contains_path(parent: str, child: str) -> bool:
         return False
 
 
+def contains_path_lexical(parent: str, child: str) -> bool:
+    """
+    Check if `child` is lexically inside `parent` WITHOUT following symlinks.
+
+    Unlike contains_path(), this uses the raw string paths without resolve(),
+    so a symlink at `parent/link` pointing to `/etc` is still considered
+    "inside" `parent` for the purpose of detecting symlink escapes.
+
+    Mirrors OpenCode's FSUtil.contains() used for the lexical check in
+    LocationMutation.resolve() before symlink resolution.
+    """
+    try:
+        # Normalize to absolute paths without following symlinks.
+        # os.path.abspath resolves relative to cwd but does NOT follow symlinks.
+        # If child is relative, resolve it against parent (not cwd) so that
+        # relative paths like "subdir" work correctly when parent is absolute.
+        parent_abs = os.path.abspath(parent)
+        if os.path.isabs(child):
+            child_abs = os.path.abspath(child)
+        else:
+            child_abs = os.path.abspath(os.path.join(parent_abs, child))
+        rel = os.path.relpath(child_abs, parent_abs)
+        return rel == "." or (not os.path.isabs(rel) and not rel.startswith(".."))
+    except (OSError, ValueError):
+        return False
+
+
+def detect_symlink_escape(path: str, workspace_dir: str) -> Optional[Tuple[str, str]]:
+    """
+    Check if `path` is a symlink inside the workspace that resolves outside it.
+
+    Mirrors OpenCode's LocationEscape detection:
+      1. Lexical check: is the path (before symlink resolution) inside the
+         workspace? Uses contains_path_lexical() which does NOT follow symlinks.
+      2. If lexically inside, check if it's actually a symlink.
+      3. Follow the symlink to get the real path.
+      4. Canonical check: does the real path escape the workspace?
+
+    Returns (real_path, escaped_from) if symlink escape detected, else None.
+    """
+    try:
+        p = Path(path)
+
+        # Step 1: Lexical containment check (no symlink resolution)
+        # This is the key fix — use absolute() not resolve() so symlinks
+        # that are lexically inside the workspace are caught.
+        if not contains_path_lexical(workspace_dir, str(p)):
+            return None  # Not lexically inside — handled as external path, not symlink escape
+
+        # Step 2: Is it actually a symlink?
+        if not p.is_symlink():
+            return None
+
+        # Step 3: Follow the symlink
+        real = str(p.resolve())
+
+        # Step 4: Canonical containment check — does the real path escape?
+        if not contains_path(workspace_dir, real):
+            return real, str(p)
+
+    except (OSError, ValueError):
+        pass
+
+    return None
+
+
 def _resolve_workdir(
     workdir: Optional[str],
     workspace_dir: str,
@@ -1241,6 +1353,32 @@ def extract_external_command_paths(command: str, cwd: str) -> List[str]:
     return external
 
 
+def _extract_command_tokens(command: str) -> List[Tuple[str, str]]:
+    """
+    Parse command and return (original_token, resolved_path) for each argument.
+
+    Unlike extract_external_command_paths which only returns resolved paths,
+    this preserves the original token so callers can check for symlink escapes
+    on the unresolved path.
+    """
+    try:
+        tokens = shlex.split(command)
+    except ValueError:
+        tokens = re.findall(r'(?:[^\s"\']+|"[^"]*"|\'[^\']*\')+', command)
+
+    result: List[Tuple[str, str]] = []
+    for token in tokens:
+        token = re.sub(r"^(['\"])(.*)\1$", r"\2", token)
+        token = re.sub(r"[;,|&]+$", "", token)
+        token = _normalize_bash_path(token)
+        try:
+            resolved = str(Path(token).resolve())
+            result.append((token, resolved))
+        except (OSError, ValueError):
+            pass
+    return result
+
+
 # ══════════════════════════════════════════════════════════════════════════════
 # § 6  PROCESS RUNNER
 # ══════════════════════════════════════════════════════════════════════════════
@@ -1268,8 +1406,18 @@ class ProcessRunner:
         command: str,
         cwd: str,
         timeout_ms: int = DEFAULT_TIMEOUT_MS,
+        combine_output: bool = True,
     ) -> CommandResult:
-        """Execute command and return a structured CommandResult."""
+        """Execute command and return a structured CommandResult.
+
+        Args:
+            command: Shell command string.
+            cwd: Working directory.
+            timeout_ms: Timeout in milliseconds.
+            combine_output: If True (default), merge stdout+stderr into a single
+                           output string. If False, capture them separately and
+                           populate the stdout/stderr fields on CommandResult.
+        """
         timeout_ms = max(1, min(timeout_ms, MAX_TIMEOUT_MS))
         timeout_s = timeout_ms / 1_000.0
 
@@ -1312,6 +1460,7 @@ class ProcessRunner:
             fallback_argv = _shell_argv(os.environ.get("COMSPEC", "cmd.exe"), command)
 
         proc: Optional[subprocess.Popen] = None
+        stderr_mode = subprocess.STDOUT if combine_output else subprocess.PIPE
         try:
             if IS_WINDOWS:
                 proc = subprocess.Popen(
@@ -1319,7 +1468,7 @@ class ProcessRunner:
                     shell=False,
                     cwd=str(cwd_path),
                     stdout=subprocess.PIPE,
-                    stderr=subprocess.STDOUT,
+                    stderr=stderr_mode,
                     stdin=subprocess.DEVNULL,
                     creationflags=subprocess.CREATE_NO_WINDOW,
                 )
@@ -1330,7 +1479,7 @@ class ProcessRunner:
                     executable=self.shell,
                     cwd=str(cwd_path),
                     stdout=subprocess.PIPE,
-                    stderr=subprocess.STDOUT,
+                    stderr=stderr_mode,
                     stdin=subprocess.DEVNULL,
                     start_new_session=True,
                 )
@@ -1348,7 +1497,7 @@ class ProcessRunner:
                         shell=False,
                         cwd=str(cwd_path),
                         stdout=subprocess.PIPE,
-                        stderr=subprocess.STDOUT,
+                        stderr=stderr_mode,
                         stdin=subprocess.DEVNULL,
                         creationflags=subprocess.CREATE_NO_WINDOW,
                     )
@@ -1378,9 +1527,13 @@ class ProcessRunner:
 
         # Output collector (runs in background thread to prevent pipe blocking)
         chunks: List[bytes] = []
+        stderr_chunks: List[bytes] = []
         total_in: int = 0
         truncated: bool = False
+        stderr_total_in: int = 0
+        stderr_truncated: bool = False
         read_done = threading.Event()
+        stderr_read_done = threading.Event()
 
         def _reader() -> None:
             nonlocal total_in, truncated
@@ -1401,8 +1554,32 @@ class ProcessRunner:
                     truncated = True
             read_done.set()
 
+        def _stderr_reader() -> None:
+            """Read stderr when combine_output=False, with byte limit."""
+            nonlocal stderr_total_in, stderr_truncated
+            assert proc.stderr is not None
+            while True:
+                chunk = proc.stderr.read(16_384)
+                if not chunk:
+                    break
+                remaining = MAX_CAPTURE_BYTES - stderr_total_in
+                if remaining > 0:
+                    keep = chunk if len(chunk) <= remaining else chunk[:remaining]
+                    stderr_chunks.append(keep)
+                else:
+                    stderr_truncated = True
+                stderr_total_in += len(chunk)
+                if stderr_total_in > MAX_CAPTURE_BYTES:
+                    stderr_truncated = True
+            stderr_read_done.set()
+
         reader = threading.Thread(target=_reader, daemon=True)
         reader.start()
+
+        stderr_reader: Optional[threading.Thread] = None
+        if not combine_output and proc.stderr is not None:
+            stderr_reader = threading.Thread(target=_stderr_reader, daemon=True)
+            stderr_reader.start()
 
         # Wait for process with timeout
         timed_out = False
@@ -1412,12 +1589,24 @@ class ProcessRunner:
             timed_out = True
             self._kill(proc)
 
-        # Wait for reader to flush (max 5 s after process exits)
+        # Wait for readers to flush (max 5 s after process exits)
         read_done.wait(timeout=5.0)
         reader.join(timeout=1.0)
+        stderr_read_done.wait(timeout=5.0)
+        if stderr_reader is not None:
+            stderr_reader.join(timeout=1.0)
 
         exit_code = proc.returncode if not timed_out else None
-        output = b"".join(chunks).decode("utf-8", errors="replace")
+        stdout_str = b"".join(chunks).decode("utf-8", errors="replace")
+        stderr_str = (
+            b"".join(stderr_chunks).decode("utf-8", errors="replace")
+            if stderr_chunks
+            else None
+        )
+
+        # When combine_output=True, output includes both streams (stderr was merged by OS)
+        # When combine_output=False, output is stdout only, stderr is separate
+        output = stdout_str
 
         # Save full output to temp file only when output would be truncated
         line_count = len(output.splitlines())
@@ -1436,6 +1625,9 @@ class ProcessRunner:
             cwd=cwd,
             warnings=warnings,
             output_file=output_file,
+            stdout=stdout_str if not combine_output else None,
+            stderr=stderr_str if not combine_output else None,
+            stderr_truncated=stderr_truncated if not combine_output else False,
         )
 
     def _kill(self, proc: subprocess.Popen) -> None:
@@ -1617,6 +1809,28 @@ class LocalExecutorToolkit:
                   warnings     — advisory notes (e.g. external path refs)
                   summary      — one-line status ("Exit code: 0." etc.)
             """
+            # ── Check for symlink escape BEFORE resolving workdir ──────────
+            # Must check on the raw (unresolved) path so lexical containment
+            # catches symlinks inside workspace pointing outside.
+            raw_workdir = workdir or cwd_state[0]
+            symlink_info = detect_symlink_escape(raw_workdir, self.workspace_dir)
+            if symlink_info:
+                real_path, symlink_path = symlink_info
+                return CommandResult(
+                    command=command,
+                    exit_code=1,
+                    output=(
+                        f"Symlink escape detected: '{symlink_path}' is a symlink "
+                        f"inside the workspace that resolves to '{real_path}', "
+                        f"which is outside the workspace.\n"
+                        f"Use the real path directly or remove the symlink."
+                    ),
+                    truncated=False,
+                    timed_out=False,
+                    cwd=raw_workdir,
+                    denied=True,
+                ).to_dict()
+
             # ── Resolve working directory (NEVER None — always a real path) ──
             resolved_cwd, external_workdir = _resolve_workdir(
                 workdir, self.workspace_dir, cwd_state[0]
@@ -1674,27 +1888,59 @@ class LocalExecutorToolkit:
             # ── External path scan in command arguments ────────────────────
             # Check if the command references absolute paths outside the workspace.
             # If so, prompt the user for permission (not just advisory).
-            ext_paths = extract_external_command_paths(command, resolved_cwd)
-            if ext_paths:
-                for ext_path in ext_paths[:3]:  # prompt for at most 3
-                    ext_dir = str(Path(ext_path).parent.resolve())
-                    ext_decision = permissions.request_external_directory(
-                        ext_dir,
-                        context=f"referenced in command: {command[:60]}",
-                    )
-                    if ext_decision == PermissionDecision.DENY:
-                        return CommandResult(
-                            command=command,
-                            exit_code=126,
-                            output=(
-                                f"Permission denied: command references external path "
-                                f"'{ext_path}' outside the workspace."
-                            ),
-                            truncated=False,
-                            timed_out=False,
-                            cwd=resolved_cwd,
-                            denied=True,
-                        ).to_dict()
+            # Use original tokens (not resolved) for symlink escape detection.
+            cmd_tokens = _extract_command_tokens(command)
+            checked_ext_dirs: Set[str] = set()
+            for orig_token, resolved_token in cmd_tokens:
+                if not os.path.isabs(resolved_token):
+                    continue
+                if contains_path(resolved_cwd, resolved_token):
+                    continue
+
+                # Check for symlink escape using the ORIGINAL unresolved token
+                symlink_info = detect_symlink_escape(orig_token, self.workspace_dir)
+                if symlink_info:
+                    real_path, symlink_path = symlink_info
+                    return CommandResult(
+                        command=command,
+                        exit_code=1,
+                        output=(
+                            f"Symlink escape detected: '{symlink_path}' is a symlink "
+                            f"inside the workspace that resolves to '{real_path}', "
+                            f"which is outside the workspace.\n"
+                            f"Use the real path directly or remove the symlink."
+                        ),
+                        truncated=False,
+                        timed_out=False,
+                        cwd=resolved_cwd,
+                        denied=True,
+                    ).to_dict()
+
+                # Prompt for external directory permission (deduplicate by parent dir)
+                ext_dir = str(Path(resolved_token).parent.resolve())
+                if ext_dir in checked_ext_dirs:
+                    continue
+                checked_ext_dirs.add(ext_dir)
+                if len(checked_ext_dirs) > 3:
+                    break  # prompt for at most 3 distinct external dirs
+
+                ext_decision = permissions.request_external_directory(
+                    ext_dir,
+                    context=f"referenced in command: {command[:60]}",
+                )
+                if ext_decision == PermissionDecision.DENY:
+                    return CommandResult(
+                        command=command,
+                        exit_code=126,
+                        output=(
+                            f"Permission denied: command references external path "
+                            f"'{resolved_token}' outside the workspace."
+                        ),
+                        truncated=False,
+                        timed_out=False,
+                        cwd=resolved_cwd,
+                        denied=True,
+                    ).to_dict()
 
             # ── Risk assessment + permission ───────────────────────────────
             risk, reasons = assess_risk(command)
@@ -1838,8 +2084,11 @@ __all__ = [
     "_save_output_to_file",
     # Path containment
     "contains_path",
+    "contains_path_lexical",
+    "detect_symlink_escape",
     "_resolve_workdir",
     "extract_external_command_paths",
+    "_extract_command_tokens",
     # Shell discovery
     "_find_git_bash",
     "_default_shell",
