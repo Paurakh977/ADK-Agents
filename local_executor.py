@@ -32,7 +32,7 @@ Designed after OpenCode's bash tool architecture (packages/core/src/tool/bash.ts
 
   • Timeout with SIGTERM → SIGKILL escalation (3 s grace period)
 
-  • Output capture with 512 KB safety cap + smart head/tail truncation
+  • Output capture with 1 MB safety cap + smart head/tail truncation
     Full output saved to temp file; agent can read it later if needed.
     Default: first 50 + last 250 lines (300 total) shown to LLM.
 
@@ -58,6 +58,8 @@ import shlex
 import time
 import signal
 import hashlib
+import warnings
+import json as _json
 import logging
 import tempfile
 import platform
@@ -66,9 +68,16 @@ import threading
 from enum import Enum
 from pathlib import Path
 from dataclasses import dataclass, field
-from typing import Optional, List, Set, Tuple, Callable, Any
+from typing import Optional, List, Set, Tuple, Callable, Any, Literal, Dict, Annotated
 
-from pydantic import BaseModel, Field, field_validator, model_validator
+from pydantic import (
+    BaseModel,
+    ConfigDict,
+    Field,
+    field_validator,
+    model_validator,
+)
+from pydantic.functional_validators import AfterValidator
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -77,7 +86,7 @@ from pydantic import BaseModel, Field, field_validator, model_validator
 
 DEFAULT_TIMEOUT_MS: int = 2 * 60 * 1_000  # 2 min  — matches OpenCode default
 MAX_TIMEOUT_MS: int = 10 * 60 * 1_000  # 10 min — hard ceiling
-MAX_CAPTURE_BYTES: int = 512 * 1024  # 512 KB — hard safety cap for output capture
+MAX_CAPTURE_BYTES: int = 1 * 1024 * 1024  # 1 MB — hard safety cap for output capture
 MAX_OUTPUT_LINES: int = 300  # default max lines returned to LLM
 HEAD_LINES: int = 50  # lines from start shown on success
 TAIL_LINES: int = 250  # lines from end shown on success
@@ -258,6 +267,8 @@ def _default_shell() -> str:
     return env_shell or "/bin/sh"
 
 
+import fnmatch
+
 RESET = "\033[0m"
 BOLD = "\033[1m"
 GREEN = "\033[32m"
@@ -267,6 +278,50 @@ PURPLE = "\033[35m"
 CYAN = "\033[36m"
 DIM = "\033[2m"
 SEP = "─" * 66
+
+
+# ── Wildcard matching + cross-platform path normalization ────────────────────
+
+
+def wildcard_match(pattern: str, value: str) -> bool:
+    """Match `value` against a shell-style `pattern` using fnmatch."""
+    return fnmatch.fnmatch(value, pattern)
+
+
+def _normalize_external_path(p: str) -> str:
+    """Normalize a path for cross-platform external directory matching.
+
+    Converts platform-specific temp directories to a canonical /tmp/ form
+    so that patterns like /tmp/* work on Windows, macOS, and Linux.
+    Patterns (containing wildcards) and Unix-style /tmp/ paths are NOT
+    resolved against the filesystem.
+    """
+    expanded = os.path.expanduser(os.path.expandvars(p))
+
+    if "*" in expanded or "?" in expanded:
+        return expanded.replace("\\", "/")
+
+    if expanded.startswith("/tmp/") or expanded == "/tmp":
+        return expanded
+
+    # macOS exposes /tmp as a symlink to /private/tmp; normalize both forms.
+    macos_private_tmp = "/private/tmp"
+    if expanded == macos_private_tmp or expanded.startswith(macos_private_tmp + "/"):
+        remainder = expanded[len(macos_private_tmp) :]
+        return f"/tmp{remainder}" if remainder else "/tmp"
+
+    resolved = Path(expanded).resolve()
+
+    try:
+        system_temp = Path(tempfile.gettempdir()).resolve()
+        if str(resolved).startswith(str(system_temp)):
+            remainder = str(resolved)[len(str(system_temp)) :]
+            remainder = remainder.replace("\\", "/").lstrip("/")
+            return f"/tmp/{remainder}" if remainder else "/tmp"
+    except OSError:
+        pass
+
+    return str(resolved).replace("\\", "/")
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -304,6 +359,16 @@ RISK_PATTERNS: List[Tuple[str, RiskLevel, str]] = [
         "recursive force-delete (rm -fr)",
     ),
     (
+        r"\brm\b.*\s+-[a-zA-Z]*r\b.*\s+-[a-zA-Z]*f\b",
+        RiskLevel.CRITICAL,
+        "recursive force-delete (rm -r -f)",
+    ),
+    (
+        r"\brm\b.*\s+-[a-zA-Z]*f\b.*\s+-[a-zA-Z]*r\b",
+        RiskLevel.CRITICAL,
+        "recursive force-delete (rm -f -r)",
+    ),
+    (
         r"curl\s+[^\|]+\|\s*(ba)?sh",
         RiskLevel.CRITICAL,
         "remote code execution via curl pipe",
@@ -316,6 +381,7 @@ RISK_PATTERNS: List[Tuple[str, RiskLevel, str]] = [
     (r":\(\)\s*\{[^}]*:\s*\|", RiskLevel.CRITICAL, "fork bomb pattern"),
     (r"\bmkfs\b", RiskLevel.CRITICAL, "filesystem format (mkfs)"),
     (r">\s*/dev/[sh]d[a-z]", RiskLevel.CRITICAL, "direct disk write (>/dev/sdX)"),
+    (r">\s*/etc/", RiskLevel.CRITICAL, "write to /etc"),
     (r"\bfdisk\b|\bparted\b|\bgdisk\b", RiskLevel.CRITICAL, "disk partition tool"),
     (r"\bshred\b", RiskLevel.CRITICAL, "secure file deletion (shred)"),
     (r"\bformat\s+[a-zA-Z]:", RiskLevel.CRITICAL, "Windows drive format"),
@@ -338,6 +404,10 @@ RISK_PATTERNS: List[Tuple[str, RiskLevel, str]] = [
     (r"\biptables\b|\bnftables\b|\bpf\b", RiskLevel.HIGH, "firewall rule modification"),
     (r"\bsystemctl\s+(stop|disable|mask)\b", RiskLevel.HIGH, "stopping system service"),
     (r"\bkillall\b|\bpkill\b", RiskLevel.HIGH, "bulk process termination"),
+    (r"\beval\b", RiskLevel.HIGH, "dynamic code execution via eval"),
+    (r"\bexec\b", RiskLevel.HIGH, "dynamic code execution via exec"),
+    (r"\bnc\b|\bnetcat\b", RiskLevel.HIGH, "network listener (possible reverse shell)"),
+    (r"\bcrontab\s+-r\b", RiskLevel.HIGH, "remove all cron jobs"),
     (
         r"\bnpm\s+publish\b|\bpip\s+upload\b",
         RiskLevel.HIGH,
@@ -361,7 +431,11 @@ RISK_PATTERNS: List[Tuple[str, RiskLevel, str]] = [
     ),
     (r"\bgit\s+clean\s+-[a-zA-Z]*f\b", RiskLevel.MODERATE, "force git clean"),
     (r"\bgit\s+push\b", RiskLevel.MODERATE, "git push"),
-    (r"\bgit\b", RiskLevel.MODERATE, "git command"),
+    (
+        r"\bgit\s+(?!(status|log|diff|branch|show)\b)\w+",
+        RiskLevel.MODERATE,
+        "git command that may modify repository state",
+    ),
     (r"\bnpm\s+install\b|\bnpm\s+i\b", RiskLevel.MODERATE, "npm install"),
     (r"\bpip\s+install\b|\bpip3\s+install\b", RiskLevel.MODERATE, "pip install"),
     (
@@ -371,6 +445,7 @@ RISK_PATTERNS: List[Tuple[str, RiskLevel, str]] = [
     ),
     (r"\bbrew\s+install\b", RiskLevel.MODERATE, "Homebrew install"),
     (r"\byarn\s+add\b", RiskLevel.MODERATE, "yarn add"),
+    (r"\bhistory\s+-[cw]\b", RiskLevel.MODERATE, "clear shell history"),
 ]
 
 # Commands that block waiting for stdin — they'd hang until timeout.
@@ -429,10 +504,10 @@ def _get_output_dir() -> Path:
 
 def _save_output_to_file(output: str, command: str) -> Optional[str]:
     """
-    Save full command output to a temp file.
+    Save captured command output to a temp file.
 
     Returns the file path string, or None on error.
-    The agent can later read this file if it needs the full untruncated output.
+    The agent can later read this file if it needs the preserved captured output.
     """
     try:
         cmd_hash = hashlib.sha1(command.encode()).hexdigest()[:6]
@@ -485,6 +560,49 @@ def _cleanup_old_outputs() -> None:
         pass
 
 
+def _line_window(exit_code: Optional[int]) -> Tuple[int, int]:
+    """Return the head/tail window used for smart truncation formatting."""
+    if exit_code is not None and exit_code != 0:
+        return HEAD_LINES_ERROR, TAIL_LINES_ERROR
+    return HEAD_LINES, TAIL_LINES
+
+
+def _format_truncation_suffix(
+    was_truncated: bool,
+    total_lines: int,
+    exit_code: Optional[int],
+    output_file: Optional[str],
+) -> str:
+    """Format the metadata suffix appended to truncated output blocks."""
+    suffix = ""
+    if was_truncated:
+        head_n, tail_n = _line_window(exit_code)
+        suffix += (
+            f"\n[truncated: {total_lines} total lines, "
+            f"showing first {head_n} + last {tail_n}]"
+        )
+    if output_file:
+        suffix += f"\n[full output saved to: {output_file}]"
+    return suffix
+
+
+def _compose_visible_output(
+    output: str,
+    stdout: Optional[str],
+    stderr: Optional[str],
+) -> str:
+    """Build the text block shown to the model from merged or split streams."""
+    if output:
+        return output
+
+    parts: List[str] = []
+    if stdout:
+        parts.append(f"[stdout]\n{stdout}")
+    if stderr:
+        parts.append(f"[stderr]\n{stderr}")
+    return "\n\n".join(parts)
+
+
 # ══════════════════════════════════════════════════════════════════════════════
 # § 3  PYDANTIC MODELS  (matching OpenCode's bash.ts schema architecture)
 # ══════════════════════════════════════════════════════════════════════════════
@@ -504,6 +622,14 @@ class Outcome(str, Enum):
 # ── Input schema (mirrors OpenCode's Input = Schema.Struct({...})) ──────────
 
 
+def _non_empty_strip(v: str) -> str:
+    """AfterValidator: reject empty or whitespace-only strings, strip trailing whitespace."""
+    v = v.rstrip()
+    if not v:
+        raise ValueError("command must not be empty or whitespace-only")
+    return v
+
+
 class BashInput(BaseModel):
     """
     Input schema for the bash tool.
@@ -514,11 +640,10 @@ class BashInput(BaseModel):
       timeout : int?    — timeout in ms (default 120000, max 600000)
     """
 
-    command: str = Field(
+    command: Annotated[str, AfterValidator(_non_empty_strip)] = Field(
         ...,
         description="Shell command string to execute. Supports full shell syntax: "
         "pipes, redirects, &&, ||, subshells, etc.",
-        min_length=1,
     )
     workdir: Optional[str] = Field(
         default=None,
@@ -533,13 +658,6 @@ class BashInput(BaseModel):
         f"maximum: {MAX_TIMEOUT_MS}.",
     )
 
-    @field_validator("command")
-    @classmethod
-    def _command_not_empty(cls, v: str) -> str:
-        if not v.strip():
-            raise ValueError("command must not be empty or whitespace-only")
-        return v
-
 
 # ── StructuredOutput (compact metadata — what the model sees) ───────────────
 
@@ -550,7 +668,7 @@ class BashStructuredOutput(BaseModel):
 
     Matches OpenCode's StructuredOutput:
       exit     : number?  — exit code (undefined on timeout)
-      truncated: boolean  — was output truncated at 1MB?
+      truncated: boolean  — was output truncated at 1 MB?
       timeout  : boolean? — did it time out?
     """
 
@@ -560,7 +678,7 @@ class BashStructuredOutput(BaseModel):
     )
     truncated: bool = Field(
         default=False,
-        description="True if output was truncated at the 1MB safety limit.",
+        description="True if output was truncated at the 1 MB safety limit.",
     )
     timeout: Optional[bool] = Field(
         default=None,
@@ -601,7 +719,7 @@ class BashOutput(BaseModel):
     )
     output_file: Optional[str] = Field(
         default=None,
-        description="Path to temp file containing the full untruncated output.",
+        description="Path to temp file containing the preserved captured output.",
     )
     stdout: Optional[str] = Field(
         default=None,
@@ -613,7 +731,11 @@ class BashOutput(BaseModel):
     )
     stderr_truncated: bool = Field(
         default=False,
-        description="True if stderr exceeded the 1MB safety limit (when combine_output=False).",
+        description="True if stderr exceeded the 1 MB safety limit (when combine_output=False).",
+    )
+    denied: bool = Field(
+        default=False,
+        description="True if the command was denied by the permission system.",
     )
 
     def to_model_output(self) -> List[dict]:
@@ -635,19 +757,13 @@ class BashOutput(BaseModel):
             parts.append({"type": "text", "text": warnings_text})
 
         # Block 2: smart-truncated output
-        raw = self.output or "(no output)"
-        truncated_text, was_truncated, total_lines = _smart_truncate(raw, self.exit)
-        if was_truncated:
-            if self.exit is not None and self.exit != 0:
-                head_n, tail_n = HEAD_LINES_ERROR, TAIL_LINES_ERROR
-            else:
-                head_n, tail_n = HEAD_LINES, TAIL_LINES
-            truncated_text += (
-                f"\n[truncated: {total_lines} total lines, "
-                f"showing first {head_n} + last {tail_n}]"
-            )
-        if self.output_file:
-            truncated_text += f"\n[full output saved to: {self.output_file}]"
+        visible_output = _compose_visible_output(self.output, self.stdout, self.stderr)
+        truncated_text, was_truncated, total_lines = _smart_truncate(
+            visible_output or "(no output)", self.exit
+        )
+        truncated_text += _format_truncation_suffix(
+            was_truncated, total_lines, self.exit, self.output_file
+        )
         parts.append({"type": "text", "text": truncated_text})
 
         # Block 3: summary line
@@ -662,7 +778,7 @@ class BashOutput(BaseModel):
             return "Command timed out before completion."
         if self.exit is not None:
             return f"Command exited with code {self.exit}."
-        return "Command completed."
+        return "Command failed before producing an exit code."
 
     def to_adk_dict(self) -> dict:
         """
@@ -672,25 +788,20 @@ class BashOutput(BaseModel):
         that expect a single dict response. Output is smart-truncated
         (head+tail) to keep the LLM context manageable.
         """
+        visible_output = _compose_visible_output(self.output, self.stdout, self.stderr)
         truncated_output, was_truncated, total_lines = _smart_truncate(
-            self.output or "(no output)", self.exit
+            visible_output or "(no output)", self.exit
         )
-        if was_truncated:
-            if self.exit is not None and self.exit != 0:
-                head_n, tail_n = HEAD_LINES_ERROR, TAIL_LINES_ERROR
-            else:
-                head_n, tail_n = HEAD_LINES, TAIL_LINES
-            truncated_output += (
-                f"\n[truncated: {total_lines} total lines, "
-                f"showing first {head_n} + last {tail_n}]"
-            )
-        if self.output_file:
-            truncated_output += f"\n[full output saved to: {self.output_file}]"
+        truncated_output += _format_truncation_suffix(
+            was_truncated, total_lines, self.exit, self.output_file
+        )
 
         return {
             "outcome": self._outcome().value,
             "output": truncated_output,
             "exit_code": self.exit,
+            "success": self.exit is not None and self.exit == 0,
+            "denied": self.denied,
             "truncated": was_truncated,
             "timed_out": self.timeout or False,
             "warnings": self.warnings,
@@ -721,9 +832,17 @@ class PermissionDecision(Enum):
     DENY = "deny"
 
 
+@dataclass
+class _PendingPermissionPrompt:
+    """Tracks an in-flight permission prompt so concurrent callers can share it."""
+
+    event: threading.Event
+    decision: Optional[PermissionDecision] = None
+
+
 class PermissionConfig(BaseModel):
     """
-    Permission policy configuration.
+    Deprecated permission policy configuration.
 
     Matches OpenCode's permission evaluation order:
       1. Global deny list   → PermissionDeniedError immediately
@@ -801,6 +920,7 @@ class CommandResult:
             stdout=self.stdout,
             stderr=self.stderr,
             stderr_truncated=self.stderr_truncated,
+            denied=self.denied,
         )
 
     def to_dict(self) -> dict:
@@ -856,6 +976,302 @@ def _extract_command_base(command: str) -> str:
     return tokens[0]
 
 
+# ── New config-file-based permission models ─────────────────────────────────
+
+PermissionAction = Literal["allow", "ask", "deny"]
+
+
+class BashPermissionRules(BaseModel):
+    """Ordered list of (pattern, action) pairs for bash commands."""
+
+    model_config = ConfigDict(frozen=True)
+    rules: List[Tuple[str, PermissionAction]] = Field(default_factory=list)
+
+    @classmethod
+    def from_dict(cls, d: Dict[str, PermissionAction]) -> "BashPermissionRules":
+        return cls(rules=list(d.items()))
+
+    def evaluate(self, command: str) -> PermissionAction:
+        result: PermissionAction = "ask"
+        for pattern, action in self.rules:
+            if wildcard_match(pattern, command):
+                result = action
+        return result
+
+
+class ExternalDirectoryRules(BaseModel):
+    """Permission rules for external directory access."""
+
+    model_config = ConfigDict(frozen=True)
+    rules: List[Tuple[str, PermissionAction]] = Field(default_factory=list)
+
+    @classmethod
+    def from_dict(cls, d: Dict[str, PermissionAction]) -> "ExternalDirectoryRules":
+        return cls(rules=list(d.items()))
+
+    def evaluate(self, directory: str) -> PermissionAction:
+        result: PermissionAction = "ask"
+        canonical = _normalize_external_path(directory)
+        for raw_pattern, action in self.rules:
+            pattern = _normalize_external_path(raw_pattern)
+            if wildcard_match(pattern, canonical):
+                result = action
+        return result
+
+
+class PermissionBlock(BaseModel):
+    """The full permission configuration block."""
+
+    model_config = ConfigDict(frozen=True)
+    global_default: PermissionAction = "ask"
+    bash: BashPermissionRules = Field(default_factory=BashPermissionRules)
+    external_directory: ExternalDirectoryRules = Field(
+        default_factory=ExternalDirectoryRules
+    )
+
+
+class LocalExecutorConfig(BaseModel):
+    """Full config loaded from local_executor.json files."""
+
+    model_config = ConfigDict(frozen=True, str_strip_whitespace=True)
+
+    shell: Optional[str] = None
+    timeout_ms: Annotated[int, Field(ge=1, le=MAX_TIMEOUT_MS)] = 120_000
+    permission: PermissionBlock = Field(default_factory=PermissionBlock)
+    consecutive_deny_threshold: Annotated[int, Field(ge=1, le=10)] = 2
+    non_interactive: bool = False
+
+    @field_validator("shell", mode="before")
+    @classmethod
+    def _validate_shell(cls, v: Optional[str]) -> Optional[str]:
+        if v is None:
+            return None
+        import shutil
+
+        if not os.path.isabs(v):
+            resolved = shutil.which(v)
+            if resolved:
+                return resolved
+            raise ValueError(f"Shell '{v}' not found on PATH")
+        if not os.path.isfile(v):
+            raise ValueError(f"Shell path does not exist: {v}")
+        return v
+
+
+class ConfigLoader:
+    """Loads and merges local_executor.json from multiple locations.
+
+    Resolution order:
+      1. Built-in defaults
+      2. User config:    ~/.config/local_executor/local_executor.json
+      3. Project config: {workspace_dir}/.local_executor/local_executor.json
+    """
+
+    USER_CONFIG_PATH: Path = (
+        Path.home() / ".config" / "local_executor" / "local_executor.json"
+    )
+
+    def __init__(self, workspace_dir: str) -> None:
+        self.workspace_dir = Path(workspace_dir).resolve()
+
+    def project_config_path(self) -> Path:
+        return self.workspace_dir / ".local_executor" / "local_executor.json"
+
+    def load(self) -> LocalExecutorConfig:
+        """Load and deep-merge all config layers. Returns a frozen config object."""
+        merged: Dict[str, Any] = self._builtin_defaults()
+
+        for path in [self.USER_CONFIG_PATH, self.project_config_path()]:
+            if path.exists():
+                try:
+                    data = self._read_json(path)
+                    merged = self._deep_merge(merged, data)
+                    log.info("Loaded config from %s", path)
+                except Exception as exc:
+                    log.warning("Failed to load config from %s: %s", path, exc)
+
+        merged = self._apply_env_overrides(merged)
+
+        if not self.project_config_path().exists():
+            try:
+                self._write_default_config()
+            except Exception:
+                pass
+
+        return self._build_config(self._normalize_permission_block(merged))
+
+    def _builtin_defaults(self) -> Dict[str, Any]:
+        return {
+            "timeout_ms": 120_000,
+            "consecutive_deny_threshold": 2,
+            "non_interactive": False,
+            "permission": {
+                "*": "ask",
+                "bash": {
+                    "*": "ask",
+                    "ls": "allow",
+                    "ls *": "allow",
+                    "cat *": "allow",
+                    "echo *": "allow",
+                    "pwd": "allow",
+                    "whoami": "allow",
+                    "date": "allow",
+                    "grep *": "allow",
+                    "find *": "allow",
+                    "which *": "allow",
+                    "python3 -c *": "allow",
+                    "git status*": "allow",
+                    "git log*": "allow",
+                    "git diff*": "allow",
+                    "git branch*": "allow",
+                },
+                "external_directory": {
+                    "*": "ask",
+                    "/tmp/*": "allow",
+                },
+            },
+        }
+
+    def _write_default_config(self) -> None:
+        config_path = self.project_config_path()
+        config_path.parent.mkdir(parents=True, exist_ok=True)
+        default_content = {
+            "$schema": "./local_executor.schema.json",
+            "shell": None,
+            "timeout_ms": 120000,
+            "permission": {
+                "*": "ask",
+                "bash": {
+                    "*": "ask",
+                    "ls": "allow",
+                    "ls *": "allow",
+                    "cat *": "allow",
+                    "echo *": "allow",
+                    "pwd": "allow",
+                    "whoami": "allow",
+                    "date": "allow",
+                    "grep *": "allow",
+                    "find *": "allow",
+                    "which *": "allow",
+                    "python3 -c *": "allow",
+                    "git status*": "allow",
+                    "git log*": "allow",
+                    "git diff*": "allow",
+                    "git branch*": "allow",
+                    "git push*": "deny",
+                    "rm *": "ask",
+                    "sudo *": "deny",
+                },
+                "external_directory": {
+                    "*": "ask",
+                    "/tmp/*": "allow",
+                },
+            },
+            "consecutive_deny_threshold": 2,
+            "non_interactive": False,
+        }
+        config_path.write_text(_json.dumps(default_content, indent=2), encoding="utf-8")
+
+    def _read_json(self, path: Path) -> Dict[str, Any]:
+        text = path.read_text(encoding="utf-8")
+        text = re.sub(r"(?m)^\s*//.*$", "", text)
+        return _json.loads(text)
+
+    def _deep_merge(self, base: Dict, override: Dict) -> Dict:
+        result = dict(base)
+        for k, v in override.items():
+            if k in result and isinstance(result[k], dict) and isinstance(v, dict):
+                result[k] = self._deep_merge(result[k], v)
+            else:
+                result[k] = v
+        return result
+
+    def _apply_env_overrides(self, data: Dict[str, Any]) -> Dict[str, Any]:
+        """Apply LE_* environment variable overrides.
+
+        Supported env vars:
+          LE_SHELL               → shell
+          LE_TIMEOUT_MS          → timeout_ms (int)
+          LE_NON_INTERACTIVE     → non_interactive (true/false/1/0)
+          LE_PERMISSION_BASH     → JSON string for permission.bash dict
+          LE_PERMISSION_DEFAULT  → global permission default (allow/ask/deny)
+        """
+        result = dict(data)
+        if shell := os.environ.get("LE_SHELL"):
+            result["shell"] = shell
+        if timeout := os.environ.get("LE_TIMEOUT_MS"):
+            try:
+                result["timeout_ms"] = int(timeout)
+            except ValueError:
+                log.warning("Invalid LE_TIMEOUT_MS value: %s", timeout)
+        if ni := os.environ.get("LE_NON_INTERACTIVE"):
+            result["non_interactive"] = ni.lower() in ("true", "1", "yes")
+        if bash_rules := os.environ.get("LE_PERMISSION_BASH"):
+            try:
+                perm = result.setdefault("permission", {})
+                perm["bash"] = _json.loads(bash_rules)
+            except _json.JSONDecodeError:
+                log.warning("Invalid LE_PERMISSION_BASH JSON: %s", bash_rules[:100])
+        if default_perm := os.environ.get("LE_PERMISSION_DEFAULT"):
+            perm = result.setdefault("permission", {})
+            perm["*"] = default_perm
+        return result
+
+    def _normalize_permission_block(self, data: Dict[str, Any]) -> Dict[str, Any]:
+        """Convert raw dict into PermissionBlock-compatible structure."""
+        raw_perm = data.get("permission", {})
+        if isinstance(raw_perm, str):
+            data["permission"] = PermissionBlock(
+                global_default=raw_perm,  # type: ignore
+                bash=BashPermissionRules(),
+                external_directory=ExternalDirectoryRules(),
+            )
+            return data
+
+        global_default = raw_perm.get("*", "ask")
+        bash_dict = raw_perm.get("bash", {})
+        ext_dict = raw_perm.get("external_directory", {})
+
+        data["permission"] = PermissionBlock(
+            global_default=global_default,  # type: ignore
+            bash=BashPermissionRules.from_dict(bash_dict)
+            if isinstance(bash_dict, dict)
+            else BashPermissionRules(),
+            external_directory=ExternalDirectoryRules.from_dict(ext_dict)
+            if isinstance(ext_dict, dict)
+            else ExternalDirectoryRules(),
+        )
+        return data
+
+    def _build_config(self, data: Dict[str, Any]) -> LocalExecutorConfig:
+        raw_perm = data.get("permission", {})
+
+        # If permission is already a PermissionBlock (from _normalize_permission_block), use it directly
+        if isinstance(raw_perm, PermissionBlock):
+            permission = raw_perm
+        else:
+            global_default: PermissionAction = raw_perm.get("*", "ask")  # type: ignore
+            bash_dict = raw_perm.get("bash", {})
+            ext_dict = raw_perm.get("external_directory", {})
+            permission = PermissionBlock(
+                global_default=global_default,  # type: ignore
+                bash=BashPermissionRules.from_dict(bash_dict)
+                if isinstance(bash_dict, dict)
+                else BashPermissionRules(),
+                external_directory=ExternalDirectoryRules.from_dict(ext_dict)
+                if isinstance(ext_dict, dict)
+                else ExternalDirectoryRules(),
+            )
+
+        return LocalExecutorConfig(
+            shell=data.get("shell"),
+            timeout_ms=data.get("timeout_ms", 120_000),
+            consecutive_deny_threshold=data.get("consecutive_deny_threshold", 2),
+            non_interactive=data.get("non_interactive", False),
+            permission=permission,
+        )
+
+
 class PermissionManager:
     """
     Three-outcome permission gate, mirroring OpenCode's PermissionV2:
@@ -863,20 +1279,78 @@ class PermissionManager:
         ALLOW_ONCE    — user said yes just for this invocation
         ALLOW_SESSION — user said yes; rule saved for the entire session
         DENY          — user said no; execution blocked
+
+    Config-driven: uses LocalExecutorConfig rules (last-match-wins via fnmatch).
+    Risk level is shown as supplementary info in the prompt, not used for blocking.
     """
 
-    def __init__(self, config: PermissionConfig):
-        self.config = config
-        # Exact commands allowed for the session (case-sensitive).
-        # We also store "prefix*" patterns for wildcard session allows.
-        self._session_allows: Set[str] = set()
-        # External directories allowed for the session (canonical paths).
-        # Checked before prompting in request_external_directory().
+    def __init__(
+        self,
+        config: Optional[LocalExecutorConfig] = None,
+        compat: Optional[PermissionConfig] = None,
+    ):
+        if compat is not None:
+            warnings.warn(
+                "PermissionConfig is deprecated; use LocalExecutorConfig instead.",
+                DeprecationWarning,
+                stacklevel=2,
+            )
+        if config is not None and compat is not None:
+            log.warning(
+                "PermissionConfig was provided alongside LocalExecutorConfig and will be ignored."
+            )
+        if config is not None:
+            self._config = config
+        elif compat is not None:
+            self._config = self._convert_permission_config(compat)
+        else:
+            self._config = LocalExecutorConfig()
+        self._compat = compat
+        self._session_allows: Dict[str, PermissionAction] = {}
         self._session_ext_allows: Set[str] = set()
-        # Track recent denials for consecutive-denial detection.
-        # Each entry is (exact_command, base_command).
         self._denial_history: List[Tuple[str, str]] = []
+        self._pending_prompts: Dict[str, _PendingPermissionPrompt] = {}
         self._lock = threading.Lock()
+
+    @staticmethod
+    def _convert_permission_config(pc: PermissionConfig) -> LocalExecutorConfig:
+        """Convert old-style PermissionConfig to new LocalExecutorConfig."""
+        if pc.auto_approve:
+            bash_rules = BashPermissionRules.from_dict({"*": "allow"})
+            ext_rules = ExternalDirectoryRules.from_dict({"*": "allow"})
+        else:
+            bash_rules = BashPermissionRules()
+            ext_rules = ExternalDirectoryRules()
+        return LocalExecutorConfig(
+            permission=PermissionBlock(bash=bash_rules, external_directory=ext_rules),
+            non_interactive=pc.auto_approve,
+        )
+
+    def evaluate_bash(self, command: str) -> PermissionAction:
+        """Evaluate a bash command against loaded config rules.
+
+        Also checks session-level overrides (from interactive 'always' choices).
+        Returns "allow", "ask", or "deny".
+        """
+        # Session-level overrides first (user chose "allow always" in this session)
+        with self._lock:
+            session_rules = list(self._session_allows.items())
+        for pattern, action in session_rules:
+            if fnmatch.fnmatch(command, pattern):
+                log.debug(
+                    "permission.session_match command=%r pattern=%r action=%s",
+                    command[:60],
+                    pattern,
+                    action,
+                )
+                return action
+
+        # Config rules (last-match wins)
+        action = self._config.permission.bash.evaluate(command)
+        if action == "ask" and self._config.non_interactive:
+            return "deny"  # non-interactive mode: ask → deny
+
+        return action
 
     # ── Public API ────────────────────────────────────────────────────────────
 
@@ -884,64 +1358,78 @@ class PermissionManager:
         self, command: str, risk: RiskLevel, reasons: List[str]
     ) -> PermissionDecision:
         """Gate the command. Returns the decision."""
+        while True:
+            # 1. Session-cached allow (exact match or wildcard)
+            if self._is_session_allowed(command):
+                log.info("permission.session_allowed command=%r", command[:60])
+                print(f"  {DIM}[permission] session-allowed: {command[:60]}{RESET}")
+                return PermissionDecision.ALLOW_ONCE
 
-        # 1. Auto-approve (testing / CI mode)
-        if self.config.auto_approve:
-            return PermissionDecision.ALLOW_ONCE
+            # 2. Config rules — the primary decision source
+            action = self.evaluate_bash(command)
+            if action == "allow":
+                log.info("permission.config_allow command=%r", command[:60])
+                return PermissionDecision.ALLOW_ONCE
+            if action == "deny":
+                log.info("permission.config_deny command=%r", command[:60])
+                self._record_denial(command)
+                return PermissionDecision.DENY
 
-        # 2. Safe → always allow
-        if risk == RiskLevel.SAFE:
-            return PermissionDecision.ALLOW_ONCE
+            # 3. action == "ask": check consecutive denials, then coordinate prompt ownership
+            auto_deny_msg = self._check_consecutive_denials(command)
+            if auto_deny_msg:
+                print(f"\n  {RED}✗ {auto_deny_msg}{RESET}\n")
+                return PermissionDecision.DENY
 
-        # 3. Session-cached allow (exact match or base-command wildcard)
-        if self._is_session_allowed(command):
-            print(f"  {DIM}[permission] session-allowed: {command[:60]}{RESET}")
-            return PermissionDecision.ALLOW_ONCE
+            with self._lock:
+                pending = self._pending_prompts.get(command)
+                if pending is None:
+                    pending = _PendingPermissionPrompt(event=threading.Event())
+                    self._pending_prompts[command] = pending
+                    owns_prompt = True
+                else:
+                    owns_prompt = False
 
-        # 4. Auto-deny critical if configured
-        if self.config.deny_critical and risk == RiskLevel.CRITICAL:
-            print(
-                f"\n{PURPLE}[PERMISSION] Critical command auto-denied (deny_critical=True).{RESET}"
-            )
-            return PermissionDecision.DENY
+            if owns_prompt:
+                try:
+                    decision = self._prompt(command, risk, reasons)
+                    pending.decision = decision
+                finally:
+                    pending.event.set()
+                    with self._lock:
+                        self._pending_prompts.pop(command, None)
+                return pending.decision or PermissionDecision.DENY
 
-        # 5. Below the ask threshold → allow silently
-        if risk.value < self.config.min_ask_level.value:
-            return PermissionDecision.ALLOW_ONCE
-
-        # 6. Consecutive-denial detection: same exact cmd denied 2x → auto-deny 3rd
-        #    OR same base cmd denied 2x → auto-deny 3rd.
-        #    After auto-deny, history is cleared so the 4th attempt prompts again.
-        auto_deny_msg = self._check_consecutive_denials(command)
-        if auto_deny_msg:
-            print(f"\n  {RED}✗ {auto_deny_msg}{RESET}\n")
-            return PermissionDecision.DENY
-
-        # 7. Interactive prompt
-        return self._prompt(command, risk, reasons)
+            pending.event.wait()
+            if pending.decision is not None:
+                return pending.decision
 
     def request_external_directory(
         self, directory: str, context: str = "command"
     ) -> PermissionDecision:
         """
         Prompt the user for permission to access a directory outside the workspace.
-
-        Mirrors OpenCode's externalDirectoryPermission flow:
-          - Checks session-cache first (no re-prompt for approved dirs)
-          - Shows the directory path and context
-          - 3 options: allow once, allow for session, deny
-          - Session-cached dirs are stored in _session_ext_allows
         """
-        if self.config.auto_approve:
+        # Auto-allow system temp dir (cross-platform: /tmp on all OSes)
+        canonical = _normalize_external_path(directory)
+        if canonical == "/tmp" or canonical.startswith("/tmp/"):
             return PermissionDecision.ALLOW_ONCE
 
-        # Check session cache — if this directory was already approved, skip prompt
-        canonical = str(Path(directory).resolve())
+        # Check config rules
+        config_action = self._config.permission.external_directory.evaluate(directory)
+        if config_action == "allow":
+            return PermissionDecision.ALLOW_ONCE
+        if config_action == "deny":
+            return PermissionDecision.DENY
+
+        # non_interactive → deny
+        if self._config.non_interactive:
+            return PermissionDecision.DENY
+
+        # Check session cache
+        resolved = _normalize_external_path(directory)
         with self._lock:
-            if canonical in self._session_ext_allows:
-                print(
-                    f"  {DIM}[permission] session-allowed external dir: {directory[:60]}{RESET}"
-                )
+            if resolved in self._session_ext_allows:
                 return PermissionDecision.ALLOW_ONCE
 
         truncated_dir = directory if len(directory) <= 72 else directory[:69] + "..."
@@ -986,7 +1474,7 @@ class PermissionManager:
     def add_session_allow(self, command: str) -> None:
         """Programmatically add a session-wide allow (e.g. from CLI flags)."""
         with self._lock:
-            self._session_allows.add(command)
+            self._session_allows[command] = "allow"
 
     # ── Denial message for external callers (execute_shell_command) ────────────
 
@@ -999,72 +1487,69 @@ class PermissionManager:
             history = list(self._denial_history)
         base = _extract_command_base(command)
 
-        # Check if this exact command was recently denied
+        threshold = self._config.consecutive_deny_threshold
         exact_count = sum(1 for d in history if d[0] == command)
         base_count = sum(1 for d in history if d[1] == base)
 
-        if exact_count >= 2:
+        if exact_count >= threshold:
             return (
-                f"Permission denied — the user has already refused this exact "
-                f"command ({exact_count} times). Something may be wrong with "
-                f"this command. Ask the user what they want to do instead."
+                f"Permission denied for this exact command ({exact_count} times). "
+                f"Try a different command or approach."
             )
-        if base_count >= 2:
+        if base_count >= threshold:
             return (
-                f"Permission denied — the user has refused '{base}' commands "
-                f"recently ({base_count} times). The user may not want to run "
-                f"this type of command. Try a different approach."
+                f"Permission denied for '{base}' commands ({base_count} times). "
+                f"Try a different command or approach."
             )
-        return "Permission denied by user."
+        return "Permission denied by user. Try a different approach."
 
     # ── Internal ──────────────────────────────────────────────────────────────
 
     def _is_session_allowed(self, command: str) -> bool:
-        """Check if command matches any session-wide allow (exact or wildcard)."""
+        """Check if command matches any session-wide allow (exact or wildcard).
+
+        Uses fnmatch for correct wildcard semantics — "git *" matches "git push"
+        but NOT "github-cli". Patterns are copied under lock then matched outside
+        to avoid holding the lock during iteration.
+        """
         with self._lock:
-            if command in self._session_allows:
+            patterns = list(self._session_allows)
+        for pattern in patterns:
+            if fnmatch.fnmatch(command, pattern):
                 return True
-            for pattern in self._session_allows:
-                if pattern.endswith("*") and command.startswith(pattern[:-1]):
-                    return True
         return False
 
     def _check_consecutive_denials(self, command: str) -> Optional[str]:
         """
-        If the last 2 denials were the same exact command, or the same base
+        If the last N denials were the same exact command, or the same base
         command, auto-deny this attempt with an informative message.
+        Uses config.consecutive_deny_threshold (default 2).
 
         Returns the denial message string, or None if no auto-deny.
         After auto-deny, clears history so the next attempt prompts again.
         """
+        threshold = self._config.consecutive_deny_threshold
         with self._lock:
-            history = list(self._denial_history)
+            if len(self._denial_history) < threshold:
+                return None
+            last_n = self._denial_history[-threshold:]
+            base = _extract_command_base(command)
 
-        if len(history) < 2:
-            return None
-
-        last_two = history[-2:]
-        base = _extract_command_base(command)
-
-        # Same exact command denied twice in a row
-        if all(d[0] == command for d in last_two):
-            with self._lock:
+            # Same exact command denied N times in a row
+            if all(d[0] == command for d in last_n):
                 self._denial_history.clear()
-            return (
-                f"Auto-denied: the user has already refused this exact command "
-                f"twice. Something may be wrong with this command, or the user "
-                f"does not want to run it. Ask the user or try a different approach."
-            )
+                return (
+                    f"Auto-denied: this exact command was refused {threshold} times. "
+                    f"Try a different command or approach."
+                )
 
-        # Same base command denied twice in a row (different exact commands)
-        if all(d[1] == base for d in last_two):
-            with self._lock:
+            # Same base command denied N times in a row (different exact commands)
+            if all(d[1] == base for d in last_n):
                 self._denial_history.clear()
-            return (
-                f"Auto-denied: the user has refused '{base}' commands twice "
-                f"recently. The user may not want to use this type of command. "
-                f"Ask the user or try a completely different approach."
-            )
+                return (
+                    f"Auto-denied: '{base}' commands were refused {threshold} times. "
+                    f"Try a different command or approach."
+                )
 
         return None
 
@@ -1073,20 +1558,21 @@ class PermissionManager:
         base = _extract_command_base(command)
         with self._lock:
             self._denial_history.append((command, base))
-            # Keep only last 5 to prevent unbounded growth
-            if len(self._denial_history) > 5:
-                self._denial_history = self._denial_history[-5:]
+            # Keep only last N+2 to prevent unbounded growth
+            max_history = self._config.consecutive_deny_threshold + 3
+            if len(self._denial_history) > max_history:
+                self._denial_history = self._denial_history[-max_history:]
 
     def _prompt(
         self, command: str, risk: RiskLevel, reasons: List[str]
     ) -> PermissionDecision:
-        """Blocking terminal prompt with 4 options."""
+        """Blocking terminal prompt with 5 options."""
         reason_str = ", ".join(reasons) if reasons else "unknown risk"
         truncated_cmd = command if len(command) <= 72 else command[:69] + "..."
         base = _extract_command_base(command)
 
         print(f"\n{SEP}")
-        print(f"  {BOLD}PERMISSION REQUEST — {risk.label()}{RESET}")
+        print(f"  {BOLD}PERMISSION REQUEST \u2014 {risk.label()}{RESET}")
         print(SEP)
         print(f"  {BOLD}Command :{RESET} {CYAN}{truncated_cmd}{RESET}")
         print(f"  {BOLD}Risk    :{RESET} {reason_str}")
@@ -1097,38 +1583,291 @@ class PermissionManager:
             f'  {BOLD}[3]{RESET}  Allow "{base}" for entire session (all {base} commands)'
         )
         print(f"  {BOLD}[4]{RESET}  Deny")
+        print(f"  {BOLD}[5]{RESET}  Deny always for this session (exact command)")
         print(SEP)
 
         while True:
             try:
-                choice = input("  Your choice [1/2/3/4]: ").strip()
+                choice = input("  Your choice [1/2/3/4/5]: ").strip()
             except (EOFError, KeyboardInterrupt):
-                print(f"\n  {RED}✗ Denied (interrupted){RESET}\n{SEP}\n")
+                print(f"\n  {RED}\u2717 Denied (interrupted){RESET}\n{SEP}\n")
                 self._record_denial(command)
                 return PermissionDecision.DENY
 
             if choice == "1":
-                print(f"  {GREEN}✓ Allowed (once){RESET}\n{SEP}\n")
+                print(f"  {GREEN}\u2713 Allowed (once){RESET}\n{SEP}\n")
                 return PermissionDecision.ALLOW_ONCE
             elif choice == "2":
-                print(f"  {GREEN}✓ Allowed (session — exact command){RESET}\n{SEP}\n")
-                with self._lock:
-                    self._session_allows.add(command)
-                return PermissionDecision.ALLOW_SESSION
-            elif choice == "3":
-                wildcard = f"{base}*"
                 print(
-                    f'  {GREEN}✓ Allowed (session — all "{base}" commands){RESET}\n{SEP}\n'
+                    f"  {GREEN}\u2713 Allowed (session \u2014 exact command){RESET}\n{SEP}\n"
                 )
                 with self._lock:
-                    self._session_allows.add(wildcard)
+                    self._session_allows[command] = "allow"
+                return PermissionDecision.ALLOW_SESSION
+            elif choice == "3":
+                wildcard = f"{base} *"
+                print(
+                    f'  {GREEN}\u2713 Allowed (session \u2014 all "{base}" commands){RESET}\n{SEP}\n'
+                )
+                with self._lock:
+                    self._session_allows[wildcard] = "allow"
                 return PermissionDecision.ALLOW_SESSION
             elif choice == "4":
-                print(f"  {RED}✗ Denied{RESET}\n{SEP}\n")
+                print(f"  {RED}\u2717 Denied{RESET}\n{SEP}\n")
+                self._record_denial(command)
+                return PermissionDecision.DENY
+            elif choice == "5":
+                print(
+                    f'  {RED}\u2717 Denied (session \u2014 exact command "{command[:40]}")'
+                    f"{RESET}\n{SEP}\n"
+                )
+                with self._lock:
+                    self._session_allows[command] = "deny"
                 self._record_denial(command)
                 return PermissionDecision.DENY
             else:
-                print("  Please enter 1, 2, 3, or 4.")
+                print("  Please enter 1, 2, 3, 4, or 5.")
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# § 4b  RISK ASSESSMENT MODEL
+# ══════════════════════════════════════════════════════════════════════════════
+
+
+class RiskAssessment(BaseModel):
+    """Structured result from assess_risk(), replacing flat tuple return."""
+
+    model_config = ConfigDict(frozen=True)
+
+    level: RiskLevel = Field(description="Highest risk level detected.")
+    reasons: List[str] = Field(
+        default_factory=list, description="Human-readable risk reasons."
+    )
+    matched_patterns: List[str] = Field(
+        default_factory=list, description="Regex patterns that matched."
+    )
+
+    @property
+    def is_interactive(self) -> bool:
+        return any("interactive" in r.lower() for r in self.reasons)
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# § 4c  ENV FILE PROTECTION
+# ══════════════════════════════════════════════════════════════════════════════
+
+ENV_FILE_PATTERNS: List[str] = [
+    r"\.env(?:\s|$|['\"\`;&|])",
+    r"\.env\.\w+\b",
+]
+_ENV_PATTERN = re.compile("|".join(ENV_FILE_PATTERNS))
+
+
+def _check_env_file_exposure(command: str) -> bool:
+    """Return True if command might expose .env file contents."""
+    return bool(_ENV_PATTERN.search(command))
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# § 4d  COMMAND HANDLE (abort / cancellation)
+# ══════════════════════════════════════════════════════════════════════════════
+
+
+class CommandHandle:
+    """Opaque handle returned by ProcessRunner for external cancellation.
+
+    Call .cancel() from another thread to kill the process early.
+    """
+
+    def __init__(self) -> None:
+        self._cancel_event = threading.Event()
+        self._result_ready = threading.Event()
+        self._result: Optional[CommandResult] = None
+
+    def cancel(self) -> None:
+        """Signal the running command to stop. Thread-safe."""
+        self._cancel_event.set()
+
+    def wait(self, timeout: Optional[float] = None) -> Optional[CommandResult]:
+        """Block until command finishes or timeout. Returns CommandResult or None."""
+        self._result_ready.wait(timeout=timeout)
+        return self._result
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# § 4e  DOOM LOOP DETECTOR
+# ══════════════════════════════════════════════════════════════════════════════
+
+
+class DoomLoopDetector:
+    """Detects when the agent is stuck repeating the same command."""
+
+    def __init__(self, threshold: int = 3) -> None:
+        self._threshold = threshold
+        self._history: List[str] = []
+        self._lock = threading.Lock()
+
+    def record(self, command: str) -> bool:
+        """Record a command. Returns True if doom loop detected."""
+        with self._lock:
+            self._history.append(command)
+            if len(self._history) < self._threshold:
+                return False
+            last_n = self._history[-self._threshold :]
+            return all(c == command for c in last_n)
+
+    def reset(self) -> None:
+        with self._lock:
+            self._history.clear()
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# § 4f  CONFIG WATCHER (hot-reload)
+# ══════════════════════════════════════════════════════════════════════════════
+
+
+class ConfigWatcher:
+    """Watches the project config file and triggers reload on change."""
+
+    def __init__(
+        self,
+        loader: ConfigLoader,
+        on_reload: Callable[[LocalExecutorConfig], None],
+    ) -> None:
+        self._loader = loader
+        self._on_reload = on_reload
+        self._path = loader.project_config_path()
+        self._mtime: Optional[float] = None
+        self._thread: Optional[threading.Thread] = None
+        self._stop = threading.Event()
+
+    def start(self) -> None:
+        self._thread = threading.Thread(target=self._watch, daemon=True)
+        self._thread.start()
+
+    def stop(self) -> None:
+        self._stop.set()
+
+    def _watch(self) -> None:
+        while not self._stop.is_set():
+            try:
+                if self._path.exists():
+                    mtime = self._path.stat().st_mtime
+                    if self._mtime is None:
+                        self._mtime = mtime
+                        config = self._loader.load()
+                        self._on_reload(config)
+                        log.info(
+                            "Config loaded from newly detected file %s", self._path
+                        )
+                    elif mtime != self._mtime:
+                        config = self._loader.load()
+                        self._on_reload(config)
+                        log.info("Config reloaded from %s", self._path)
+                        self._mtime = mtime
+            except Exception as exc:
+                log.warning("Config watcher error: %s", exc)
+            self._stop.wait(timeout=2.0)
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# § 4g  SCHEMA GENERATION
+# ══════════════════════════════════════════════════════════════════════════════
+
+
+def generate_json_schema(output_path: Optional[str] = None) -> dict:
+    """Generate and optionally write the JSON schema for local_executor.json."""
+    permission_action_enum = {
+        "type": "string",
+        "enum": ["allow", "ask", "deny"],
+    }
+    wildcard_rule_map = {
+        "type": "object",
+        "propertyNames": {"type": "string"},
+        "additionalProperties": permission_action_enum,
+        "default": {},
+    }
+    schema = {
+        "$schema": "https://json-schema.org/draft/2020-12/schema",
+        "title": "LocalExecutorConfigFile",
+        "type": "object",
+        "additionalProperties": False,
+        "properties": {
+            "$schema": {"type": "string"},
+            "shell": {"type": ["string", "null"]},
+            "timeout_ms": {
+                "type": "integer",
+                "minimum": 1,
+                "maximum": MAX_TIMEOUT_MS,
+                "default": 120000,
+            },
+            "permission": {
+                "type": "object",
+                "additionalProperties": False,
+                "properties": {
+                    "*": permission_action_enum,
+                    "bash": wildcard_rule_map,
+                    "external_directory": wildcard_rule_map,
+                },
+                "default": {
+                    "*": "ask",
+                    "bash": {},
+                    "external_directory": {},
+                },
+            },
+            "consecutive_deny_threshold": {
+                "type": "integer",
+                "minimum": 1,
+                "maximum": 10,
+                "default": 2,
+            },
+            "non_interactive": {"type": "boolean", "default": False},
+        },
+    }
+    if output_path:
+        Path(output_path).write_text(_json.dumps(schema, indent=2), encoding="utf-8")
+        log.info("Schema written to %s", output_path)
+    return schema
+
+
+def _tokenize_command(command: str) -> List[str]:
+    """Split shell text into tokens with a regex fallback for malformed syntax."""
+    try:
+        return shlex.split(command)
+    except ValueError:
+        return re.findall(r'(?:[^\s"\']+|"[^"]*"|\'[^\']*\')+', command)
+
+
+def _clean_command_token(token: str) -> str:
+    """Strip wrappers/operators around a token before path analysis."""
+    token = re.sub(r"^(['\"])(.*)\1$", r"\2", token)
+    token = re.sub(r"[;,|&]+$", "", token)
+    return _normalize_bash_path(token)
+
+
+def _extract_command_paths(
+    command: str,
+    cwd: str,
+    include_relative: bool = False,
+) -> List[Tuple[str, str]]:
+    """Return (original_token, resolved_path) pairs for path-like command tokens."""
+    base_cwd = Path(cwd).resolve()
+    result: List[Tuple[str, str]] = []
+    for raw_token in _tokenize_command(command):
+        token = _clean_command_token(raw_token)
+        if not token:
+            continue
+        if os.path.isabs(token):
+            candidate = Path(token)
+        elif include_relative:
+            candidate = base_cwd / token
+        else:
+            continue
+        try:
+            result.append((token, str(candidate.resolve())))
+        except (OSError, ValueError):
+            pass
+    return result
 
 
 def _normalize_bash_path(p: str) -> str:
@@ -1171,36 +1910,22 @@ def detect_external_paths(command: str, cwd: str) -> List[str]:
     This is advisory only — it does NOT block execution. Mirrors OpenCode's
     externalCommandDirectories() function.
     """
-    try:
-        tokens = shlex.split(command)
-    except ValueError:
-        # Fallback for complex shell syntax shlex can't parse
-        tokens = re.findall(r'(?:[^\s"\']+|"[^"]*"|\'[^\']*\')+', command)
-
     cwd_resolved = str(Path(cwd).resolve())
-    external: Set[str] = set()
+    external_order: Dict[str, None] = {}
 
-    for token in tokens:
-        # Strip surrounding quotes
-        token = re.sub(r"^(['\"])(.*)\1$", r"\2", token)
-        # Strip trailing shell operators
-        token = re.sub(r"[;,|&]+$", "", token)
-        # Normalize Git Bash paths (/c/...) to Windows paths (C:/...)
-        token = _normalize_bash_path(token)
-
-        if not os.path.isabs(token):
-            continue
+    for _orig_token, resolved in _extract_command_paths(
+        command, cwd, include_relative=False
+    ):
         try:
-            resolved = str(Path(token).resolve())
             # If it's inside cwd, not external
             if resolved.startswith(cwd_resolved + os.sep) or resolved == cwd_resolved:
                 continue
-            parent = str(Path(token).parent.resolve())
-            external.add(parent)
+            parent = str(Path(resolved).parent.resolve())
+            external_order[parent] = None  # preserve insertion order, deduplicate
         except (OSError, ValueError):
             pass
 
-    return sorted(external)
+    return list(external_order.keys())
 
 
 def contains_path(parent: str, child: str) -> bool:
@@ -1263,6 +1988,8 @@ def detect_symlink_escape(path: str, workspace_dir: str) -> Optional[Tuple[str, 
     """
     try:
         p = Path(path)
+        if not p.is_absolute():
+            p = Path(workspace_dir) / p
 
         # Step 1: Lexical containment check (no symlink resolution)
         # This is the key fix — use absolute() not resolve() so symlinks
@@ -1328,23 +2055,13 @@ def extract_external_command_paths(command: str, cwd: str) -> List[str]:
     This is more aggressive than detect_external_paths() — it returns the
     actual external paths (not just parent directories) for permission checking.
     """
-    try:
-        tokens = shlex.split(command)
-    except ValueError:
-        tokens = re.findall(r'(?:[^\s"\']+|"[^"]*"|\'[^\']*\')+', command)
-
     cwd_resolved = str(Path(cwd).resolve())
     external: List[str] = []
 
-    for token in tokens:
-        token = re.sub(r"^(['\"])(.*)\1$", r"\2", token)
-        token = re.sub(r"[;,|&]+$", "", token)
-        # Normalize Git Bash paths (/c/...) to Windows paths (C:/...)
-        token = _normalize_bash_path(token)
-        if not os.path.isabs(token):
-            continue
+    for _orig_token, resolved in _extract_command_paths(
+        command, cwd, include_relative=False
+    ):
         try:
-            resolved = str(Path(token).resolve())
             if not contains_path(cwd_resolved, resolved):
                 external.append(resolved)
         except (OSError, ValueError):
@@ -1353,7 +2070,10 @@ def extract_external_command_paths(command: str, cwd: str) -> List[str]:
     return external
 
 
-def _extract_command_tokens(command: str) -> List[Tuple[str, str]]:
+def _extract_command_tokens(
+    command: str,
+    cwd: Optional[str] = None,
+) -> List[Tuple[str, str]]:
     """
     Parse command and return (original_token, resolved_path) for each argument.
 
@@ -1361,22 +2081,7 @@ def _extract_command_tokens(command: str) -> List[Tuple[str, str]]:
     this preserves the original token so callers can check for symlink escapes
     on the unresolved path.
     """
-    try:
-        tokens = shlex.split(command)
-    except ValueError:
-        tokens = re.findall(r'(?:[^\s"\']+|"[^"]*"|\'[^\']*\')+', command)
-
-    result: List[Tuple[str, str]] = []
-    for token in tokens:
-        token = re.sub(r"^(['\"])(.*)\1$", r"\2", token)
-        token = re.sub(r"[;,|&]+$", "", token)
-        token = _normalize_bash_path(token)
-        try:
-            resolved = str(Path(token).resolve())
-            result.append((token, resolved))
-        except (OSError, ValueError):
-            pass
-    return result
+    return _extract_command_paths(command, cwd or os.getcwd(), include_relative=True)
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -1393,7 +2098,7 @@ class ProcessRunner:
     • Combined stdout + stderr (combineOutput: true in OpenCode)
     • 1 MB output cap with truncation tracking
     • Configurable timeout with SIGTERM → SIGKILL escalation
-    • stdin closed (DEVNULL) — non-interactive only
+    • Optional stdin injection for non-interactive commands
     • New process session on POSIX for clean group kill
     • taskkill /T /F on Windows for tree kill
     """
@@ -1407,6 +2112,9 @@ class ProcessRunner:
         cwd: str,
         timeout_ms: int = DEFAULT_TIMEOUT_MS,
         combine_output: bool = True,
+        on_output: Optional[Callable[[str], None]] = None,
+        stdin: Optional[str] = None,
+        handle: Optional[CommandHandle] = None,
     ) -> CommandResult:
         """Execute command and return a structured CommandResult.
 
@@ -1417,6 +2125,9 @@ class ProcessRunner:
             combine_output: If True (default), merge stdout+stderr into a single
                            output string. If False, capture them separately and
                            populate the stdout/stderr fields on CommandResult.
+            on_output: Optional callback called with each decoded line as it arrives.
+            stdin: Optional UTF-8 text written to the process stdin, then closed.
+            handle: Optional CommandHandle for external cancellation support.
         """
         timeout_ms = max(1, min(timeout_ms, MAX_TIMEOUT_MS))
         timeout_s = timeout_ms / 1_000.0
@@ -1469,7 +2180,7 @@ class ProcessRunner:
                     cwd=str(cwd_path),
                     stdout=subprocess.PIPE,
                     stderr=stderr_mode,
-                    stdin=subprocess.DEVNULL,
+                    stdin=subprocess.PIPE if stdin is not None else subprocess.DEVNULL,
                     creationflags=subprocess.CREATE_NO_WINDOW,
                 )
             else:
@@ -1480,7 +2191,7 @@ class ProcessRunner:
                     cwd=str(cwd_path),
                     stdout=subprocess.PIPE,
                     stderr=stderr_mode,
-                    stdin=subprocess.DEVNULL,
+                    stdin=subprocess.PIPE if stdin is not None else subprocess.DEVNULL,
                     start_new_session=True,
                 )
         except (FileNotFoundError, PermissionError, OSError) as exc:
@@ -1498,7 +2209,9 @@ class ProcessRunner:
                         cwd=str(cwd_path),
                         stdout=subprocess.PIPE,
                         stderr=stderr_mode,
-                        stdin=subprocess.DEVNULL,
+                        stdin=subprocess.PIPE
+                        if stdin is not None
+                        else subprocess.DEVNULL,
                         creationflags=subprocess.CREATE_NO_WINDOW,
                     )
                 except Exception as fallback_exc:
@@ -1534,44 +2247,71 @@ class ProcessRunner:
         stderr_truncated: bool = False
         read_done = threading.Event()
         stderr_read_done = threading.Event()
+        stdin_done = threading.Event()
 
         def _reader() -> None:
             nonlocal total_in, truncated
             assert proc.stdout is not None
-            while True:
-                chunk = proc.stdout.read(16_384)
-                if not chunk:
-                    break
-                remaining = MAX_CAPTURE_BYTES - total_in
-                if remaining > 0:
-                    keep = chunk if len(chunk) <= remaining else chunk[:remaining]
-                    chunks.append(keep)
-                else:
-                    truncated = True
-                    # keep draining the pipe so the process doesn't block
-                total_in += len(chunk)
-                if total_in > MAX_CAPTURE_BYTES:
-                    truncated = True
-            read_done.set()
+            buffer = b""
+            try:
+                while True:
+                    chunk = proc.stdout.read(16_384)
+                    if not chunk:
+                        if buffer and on_output:
+                            on_output(buffer.decode("utf-8", errors="replace"))
+                        break
+                    remaining = MAX_CAPTURE_BYTES - total_in
+                    if remaining > 0:
+                        keep = chunk if len(chunk) <= remaining else chunk[:remaining]
+                        chunks.append(keep)
+                    else:
+                        truncated = True
+                    total_in += len(chunk)
+                    if total_in > MAX_CAPTURE_BYTES:
+                        truncated = True
+                    if on_output:
+                        buffer += chunk
+                        while b"\n" in buffer:
+                            line, buffer = buffer.split(b"\n", 1)
+                            on_output(line.decode("utf-8", errors="replace") + "\n")
+            except Exception as exc:
+                log.warning("Output reader error: %s", exc)
+            finally:
+                read_done.set()
 
         def _stderr_reader() -> None:
             """Read stderr when combine_output=False, with byte limit."""
             nonlocal stderr_total_in, stderr_truncated
             assert proc.stderr is not None
-            while True:
-                chunk = proc.stderr.read(16_384)
-                if not chunk:
-                    break
-                remaining = MAX_CAPTURE_BYTES - stderr_total_in
-                if remaining > 0:
-                    keep = chunk if len(chunk) <= remaining else chunk[:remaining]
-                    stderr_chunks.append(keep)
-                else:
-                    stderr_truncated = True
-                stderr_total_in += len(chunk)
-                if stderr_total_in > MAX_CAPTURE_BYTES:
-                    stderr_truncated = True
-            stderr_read_done.set()
+            try:
+                while True:
+                    chunk = proc.stderr.read(16_384)
+                    if not chunk:
+                        break
+                    remaining = MAX_CAPTURE_BYTES - stderr_total_in
+                    if remaining > 0:
+                        keep = chunk if len(chunk) <= remaining else chunk[:remaining]
+                        stderr_chunks.append(keep)
+                    else:
+                        stderr_truncated = True
+                    stderr_total_in += len(chunk)
+                    if stderr_total_in > MAX_CAPTURE_BYTES:
+                        stderr_truncated = True
+            except Exception as exc:
+                log.warning("Stderr reader error: %s", exc)
+            finally:
+                stderr_read_done.set()
+
+        def _stdin_writer() -> None:
+            try:
+                if stdin is None or proc.stdin is None:
+                    return
+                proc.stdin.write(stdin.encode("utf-8"))
+                proc.stdin.close()
+            except Exception as exc:
+                log.warning("Stdin writer error: %s", exc)
+            finally:
+                stdin_done.set()
 
         reader = threading.Thread(target=_reader, daemon=True)
         reader.start()
@@ -1581,20 +2321,65 @@ class ProcessRunner:
             stderr_reader = threading.Thread(target=_stderr_reader, daemon=True)
             stderr_reader.start()
 
-        # Wait for process with timeout
-        timed_out = False
-        try:
-            proc.wait(timeout=timeout_s)
-        except subprocess.TimeoutExpired:
-            timed_out = True
-            self._kill(proc)
+        stdin_writer: Optional[threading.Thread] = None
+        if stdin is not None and proc.stdin is not None:
+            stdin_writer = threading.Thread(target=_stdin_writer, daemon=True)
+            stdin_writer.start()
+        else:
+            stdin_done.set()
 
-        # Wait for readers to flush (max 5 s after process exits)
-        read_done.wait(timeout=5.0)
-        reader.join(timeout=1.0)
-        stderr_read_done.wait(timeout=5.0)
+        # Wait for process with timeout + cancellation support
+        timed_out = False
+        deadline = time.monotonic() + timeout_s
+        try:
+            while True:
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    timed_out = True
+                    self._kill(proc)
+                    break
+                if handle and handle._cancel_event.is_set():
+                    self._kill(proc)
+                    result = CommandResult(
+                        command=command,
+                        exit_code=None,
+                        output="Command cancelled by caller.",
+                        truncated=False,
+                        timed_out=False,
+                        cwd=cwd,
+                        denied=False,
+                    )
+                    if handle:
+                        handle._result = result
+                        handle._result_ready.set()
+                    return result
+                try:
+                    proc.wait(timeout=min(0.2, remaining))
+                    break
+                except subprocess.TimeoutExpired:
+                    continue
+        except KeyboardInterrupt:
+            self._kill(proc)
+            timed_out = True
+
+        # Wait for readers to flush (up to 10 s after process exits; process
+        # termination itself may already have spent additional time in _kill()).
+        read_done.wait(timeout=10.0)
+        reader.join(timeout=5.0)
+        if reader.is_alive():
+            log.warning(
+                "Output reader thread still alive after 5s — output may be incomplete"
+            )
+        stderr_read_done.wait(timeout=10.0)
         if stderr_reader is not None:
-            stderr_reader.join(timeout=1.0)
+            stderr_reader.join(timeout=5.0)
+            if stderr_reader.is_alive():
+                log.warning(
+                    "Stderr reader thread still alive after 5s — output may be incomplete"
+                )
+        stdin_done.wait(timeout=2.0)
+        if stdin_writer is not None:
+            stdin_writer.join(timeout=1.0)
 
         exit_code = proc.returncode if not timed_out else None
         stdout_str = b"".join(chunks).decode("utf-8", errors="replace")
@@ -1616,7 +2401,7 @@ class ProcessRunner:
             else None
         )
 
-        return CommandResult(
+        result = CommandResult(
             command=command,
             exit_code=exit_code,
             output=output,
@@ -1629,6 +2414,10 @@ class ProcessRunner:
             stderr=stderr_str if not combine_output else None,
             stderr_truncated=stderr_truncated if not combine_output else False,
         )
+        if handle:
+            handle._result = result
+            handle._result_ready.set()
+        return result
 
     def _kill(self, proc: subprocess.Popen) -> None:
         """
@@ -1706,7 +2495,12 @@ def parse_cd_target(command: str, current_cwd: str) -> Optional[str]:
     if not m:
         return None
 
-    target = m.group(1).strip().strip("\"'")
+    target = m.group(1).strip()
+    # Strip matching outer quotes (but not unmatched ones)
+    if (target.startswith('"') and target.endswith('"')) or (
+        target.startswith("'") and target.endswith("'")
+    ):
+        target = target[1:-1]
 
     # Reject compound commands: cd /foo && ls, cd /foo; ls, cd /foo | something
     if re.search(r"[;&|]", target):
@@ -1751,10 +2545,39 @@ class LocalExecutorToolkit:
         workspace_dir: Optional[str] = None,
         shell: Optional[str] = None,
         permission_config: Optional[PermissionConfig] = None,
+        config: Optional[LocalExecutorConfig] = None,
+        load_config_files: bool = True,
     ):
         self.workspace_dir = str(Path(workspace_dir or os.getcwd()).resolve())
-        self._runner = ProcessRunner(shell=shell)
-        self._permissions = PermissionManager(permission_config or PermissionConfig())
+        if permission_config is not None:
+            warnings.warn(
+                "permission_config is deprecated; prefer LocalExecutorConfig.",
+                DeprecationWarning,
+                stacklevel=2,
+            )
+        if config is not None and permission_config is not None:
+            log.warning(
+                "permission_config was provided alongside config and will be ignored."
+            )
+
+        # Config resolution: explicit > file-loaded > backward-compat PermissionConfig
+        if config is not None:
+            self._config = config
+        elif load_config_files:
+            loader = ConfigLoader(self.workspace_dir)
+            self._config = loader.load()
+        else:
+            self._config = LocalExecutorConfig()
+
+        # Backward compat: if old-style PermissionConfig is passed, use it
+        self._compat_permission_config = permission_config
+
+        effective_shell = shell or self._config.shell or _default_shell()
+        self._runner = ProcessRunner(shell=effective_shell)
+        self._permissions = PermissionManager(
+            config=self._config,
+            compat=self._compat_permission_config,
+        )
         self._cwd = self.workspace_dir
 
     # ── Primary tool: execute_shell_command ───────────────────────────────────
@@ -1765,11 +2588,14 @@ class LocalExecutorToolkit:
         permissions = self._permissions
         cwd_state = [self.workspace_dir]  # mutable single-element list
         call_count = [0]  # mutable counter for throttled cleanup
+        doom_detector = DoomLoopDetector(threshold=3)
+        state_lock = threading.Lock()
 
         def execute_shell_command(
             command: str,
             workdir: Optional[str] = None,
             timeout_ms: int = DEFAULT_TIMEOUT_MS,
+            stdin: Optional[str] = None,
         ) -> dict:
             """Execute a shell command with permission checking and structured output.
 
@@ -1796,6 +2622,8 @@ class LocalExecutorToolkit:
                             If the process exceeds this, it is killed and
                             timed_out=True is returned. Retry with a higher
                             value for long-running builds or downloads.
+                stdin:      Optional UTF-8 text piped to the command's stdin.
+                            Useful for non-interactive tools that read from stdin.
 
             Returns:
                 dict with:
@@ -1812,7 +2640,9 @@ class LocalExecutorToolkit:
             # ── Check for symlink escape BEFORE resolving workdir ──────────
             # Must check on the raw (unresolved) path so lexical containment
             # catches symlinks inside workspace pointing outside.
-            raw_workdir = workdir or cwd_state[0]
+            with state_lock:
+                current_cwd = cwd_state[0]
+            raw_workdir = workdir or current_cwd
             symlink_info = detect_symlink_escape(raw_workdir, self.workspace_dir)
             if symlink_info:
                 real_path, symlink_path = symlink_info
@@ -1833,7 +2663,7 @@ class LocalExecutorToolkit:
 
             # ── Resolve working directory (NEVER None — always a real path) ──
             resolved_cwd, external_workdir = _resolve_workdir(
-                workdir, self.workspace_dir, cwd_state[0]
+                workdir, self.workspace_dir, current_cwd
             )
 
             # ── External workdir: require user permission ─────────────────
@@ -1857,8 +2687,10 @@ class LocalExecutorToolkit:
                     ).to_dict()
 
             # ── Throttled cleanup of old output files ─────────────────────
-            call_count[0] += 1
-            if call_count[0] % 50 == 0:
+            with state_lock:
+                call_count[0] += 1
+                current_call_count = call_count[0]
+            if current_call_count % 50 == 0:
                 _cleanup_old_outputs()
 
             # ── Clamp timeout ──────────────────────────────────────────────
@@ -1889,7 +2721,7 @@ class LocalExecutorToolkit:
             # Check if the command references absolute paths outside the workspace.
             # If so, prompt the user for permission (not just advisory).
             # Use original tokens (not resolved) for symlink escape detection.
-            cmd_tokens = _extract_command_tokens(command)
+            cmd_tokens = _extract_command_tokens(command, resolved_cwd)
             checked_ext_dirs: Set[str] = set()
             for orig_token, resolved_token in cmd_tokens:
                 if not os.path.isabs(resolved_token):
@@ -1944,6 +2776,13 @@ class LocalExecutorToolkit:
 
             # ── Risk assessment + permission ───────────────────────────────
             risk, reasons = assess_risk(command)
+
+            # ── Env file exposure warning ────────────────────────────────
+            if _check_env_file_exposure(command):
+                log.warning("Env file exposure detected in command: %s", command[:80])
+                if "env" not in reasons:
+                    reasons.append("possible .env file exposure")
+
             decision = permissions.request(command, risk, reasons)
 
             if decision == PermissionDecision.DENY:
@@ -1958,22 +2797,49 @@ class LocalExecutorToolkit:
                     denied=True,
                 ).to_dict()
 
+            # ── Doom loop detection ──────────────────────────────────────
+            if doom_detector.record(command):
+                return CommandResult(
+                    command=command,
+                    exit_code=126,
+                    output=(
+                        f"Doom loop detected: the same command '{command[:60]}' has been run "
+                        f"{doom_detector._threshold} times consecutively. "
+                        "Stop repeating this command. Investigate why it keeps failing and try a "
+                        "different approach, or ask the user for guidance."
+                    ),
+                    truncated=False,
+                    timed_out=False,
+                    cwd=resolved_cwd,
+                    denied=True,
+                ).to_dict()
+
             # ── Execute ────────────────────────────────────────────────────
-            result = runner.run(command, resolved_cwd, timeout_ms)
+            result = runner.run(
+                command,
+                resolved_cwd,
+                timeout_ms,
+                on_output=None,
+                stdin=stdin,
+            )
 
             # ── Track cwd if this was a bare `cd` ─────────────────────────
             if result.exit_code == 0:
+                doom_detector.reset()
                 new_cwd = parse_cd_target(command, resolved_cwd)
                 if new_cwd and Path(new_cwd).is_dir():
                     # Only allow cd within the workspace
                     if contains_path(self.workspace_dir, new_cwd):
-                        cwd_state[0] = new_cwd
+                        with state_lock:
+                            cwd_state[0] = new_cwd
                     else:
+                        with state_lock:
+                            cwd_state[0] = self.workspace_dir
                         # cd outside workspace — warn but still track
                         print(
                             f"  {YELLOW}⚠ Warning: cd to '{new_cwd}' is outside "
-                            f"workspace. Future commands will still default to "
-                            f"workspace root.{RESET}"
+                            f"workspace. Future commands will use the workspace "
+                            f"root '{self.workspace_dir}'.{RESET}"
                         )
 
             return result.to_dict()
@@ -2075,13 +2941,29 @@ __all__ = [
     # Data models
     "CommandResult",
     "RiskLevel",
+    "RiskAssessment",
+    "assess_risk",
+    "is_interactive",
     "PermissionDecision",
     "PermissionConfig",
+    "LocalExecutorConfig",
+    "ConfigLoader",
+    "ConfigWatcher",
+    # New features
+    "CommandHandle",
+    "DoomLoopDetector",
+    "generate_json_schema",
+    "wildcard_match",
     # Permission helpers
+    "BashPermissionRules",
+    "ExternalDirectoryRules",
+    "PermissionBlock",
     "_extract_command_base",
     # Output helpers
     "_smart_truncate",
     "_save_output_to_file",
+    "_check_env_file_exposure",
+    "ENV_FILE_PATTERNS",
     # Path containment
     "contains_path",
     "contains_path_lexical",
@@ -2100,3 +2982,201 @@ __all__ = [
     "MAX_OUTPUT_LINES",
     "IS_WINDOWS",
 ]
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# § 11  CLI ENTRY POINT + TESTS
+# ══════════════════════════════════════════════════════════════════════════════
+
+if __name__ == "__main__":
+    import sys as _sys
+
+    # --generate-schema CLI
+    if "--generate-schema" in _sys.argv:
+        out = (
+            _sys.argv[_sys.argv.index("--generate-schema") + 1]
+            if len(_sys.argv) > _sys.argv.index("--generate-schema") + 1
+            else "local_executor.schema.json"
+        )
+        generate_json_schema(output_path=out)
+        print(f"Schema written to {out}")
+        _sys.exit(0)
+
+    # --run-tests CLI
+    if "--run-tests" in _sys.argv:
+        print("Running built-in tests...\n")
+
+        # ── 7.1 Wildcard Matching ─────────────────────────────────────
+        print("=== Wildcard Matching ===")
+        wt = [
+            ("git *", "git push origin main", True),
+            ("git *", "github-cli auth", False),
+            ("git *", "git", False),
+            ("git push*", "git push --force", True),
+            ("rm *", "rmdir old_build", False),
+            ("ls", "ls", True),
+            ("ls", "ls -la", False),
+            ("ls*", "ls -la", True),
+            ("python3*", "python3 -c 'x=1'", True),
+            ("python3 -c *", "python3 -c print(1)", True),
+        ]
+        for pat, val, expected in wt:
+            result = wildcard_match(pat, val)
+            status = "PASS" if result == expected else "FAIL"
+            print(f"  {status}: wildcard_match({pat!r}, {val!r}) = {result}")
+        print()
+
+        # ── 7.2 Config Loading ────────────────────────────────────────
+        print("=== Config Loading ===")
+        import tempfile, json as _json
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            proj_cfg = Path(tmpdir) / ".local_executor" / "local_executor.json"
+            proj_cfg.parent.mkdir()
+            proj_cfg.write_text(
+                _json.dumps(
+                    {"timeout_ms": 30000, "permission": {"bash": {"*": "allow"}}}
+                )
+            )
+            loader = ConfigLoader(workspace_dir=tmpdir)
+            cfg = loader.load()
+            assert cfg.timeout_ms == 30000, f"timeout_ms={cfg.timeout_ms}"
+            assert cfg.permission.bash.evaluate("rm -rf /") == "allow"
+            print("  PASS: Project config overrides")
+        print()
+
+        # ── 7.3 Permission Evaluation (Last-Rule-Wins) ────────────────
+        print("=== Permission Evaluation (Last-Rule-Wins) ===")
+        rules = BashPermissionRules.from_dict(
+            {
+                "*": "ask",
+                "git *": "allow",
+                "git push*": "deny",
+                "git push --force*": "deny",
+            }
+        )
+        ev = [
+            ("ls -la", "ask"),
+            ("git status", "allow"),
+            ("git log --oneline", "allow"),
+            ("git push origin main", "deny"),
+            ("git push --force", "deny"),
+        ]
+        for cmd, expected in ev:
+            result = rules.evaluate(cmd)
+            status = "PASS" if result == expected else "FAIL"
+            print(f"  {status}: rules.evaluate({cmd!r}) = {result!r}")
+        print()
+
+        # ── 7.4 External Directory Rules ──────────────────────────────
+        print("=== External Directory Rules ===")
+        ext_rules = ExternalDirectoryRules.from_dict(
+            {"*": "ask", "/tmp/*": "allow", "~/projects/*": "allow"}
+        )
+        er = [
+            ("/tmp/build", "allow"),
+            ("/etc/passwd", "ask"),
+            (os.path.expanduser("~/projects/myapp"), "allow"),
+        ]
+        for d, expected in er:
+            result = ext_rules.evaluate(d)
+            status = "PASS" if result == expected else "FAIL"
+            print(f"  {status}: ext_rules.evaluate({d!r}) = {result!r}")
+        print()
+
+        # ── 7.5 Consecutive Denial Tracking ───────────────────────────
+        print("=== Consecutive Denial Tracking ===")
+        mgr = PermissionManager(config=LocalExecutorConfig(non_interactive=True))
+        mgr._record_denial("rm -rf /")
+        mgr._record_denial("rm -rf /")
+        result = mgr._check_consecutive_denials("rm -rf /")
+        assert result is not None, "Expected auto-deny"
+        print("  PASS: Auto-deny after 2 consecutive denials")
+
+        # Threshold=3 test
+        mgr2 = PermissionManager(config=LocalExecutorConfig(non_interactive=False))
+        mgr2._config = LocalExecutorConfig(consecutive_deny_threshold=3)
+        mgr2._record_denial("sudo something")
+        mgr2._record_denial("sudo something")
+        result2 = mgr2._check_consecutive_denials("sudo something")
+        assert result2 is None, "Should NOT auto-deny after only 2 with threshold=3"
+        print("  PASS: No auto-deny with threshold=3 after 2 denials")
+        mgr2._record_denial("sudo something")
+        result3 = mgr2._check_consecutive_denials("sudo something")
+        assert result3 is not None, "Should auto-deny after 3 with threshold=3"
+        print("  PASS: Auto-deny after 3 with threshold=3")
+        print()
+
+        # ── 7.6 BashInput Validation ──────────────────────────────────
+        print("=== BashInput Validation ===")
+        BashInput(command="ls -la")
+        print("  PASS: Normal command accepted")
+        try:
+            BashInput(command="   ")
+            print("  FAIL: Whitespace-only should be rejected")
+        except Exception:
+            print("  PASS: Whitespace-only rejected")
+        try:
+            BashInput(command="")
+            print("  FAIL: Empty string should be rejected")
+        except Exception:
+            print("  PASS: Empty string rejected")
+        print()
+
+        # ── 7.7 DoomLoopDetector ──────────────────────────────────────
+        print("=== DoomLoopDetector ===")
+        dd = DoomLoopDetector(threshold=3)
+        assert dd.record("echo hi") == False
+        assert dd.record("echo hi") == False
+        assert dd.record("echo hi") == True
+        print("  PASS: Doom loop detected after 3 identical commands")
+        dd.reset()
+        assert dd.record("echo hi") == False
+        print("  PASS: Reset works")
+        print()
+
+        # ── 7.8 CommandHandle ─────────────────────────────────────────
+        print("=== CommandHandle ===")
+        ch = CommandHandle()
+        assert not ch._cancel_event.is_set()
+        ch.cancel()
+        assert ch._cancel_event.is_set()
+        print("  PASS: CommandHandle cancel works")
+        print()
+
+        # ── 7.9 RiskAssessment ────────────────────────────────────────
+        print("=== RiskAssessment ===")
+        ra = RiskAssessment(level=RiskLevel.MODERATE, reasons=["git push"])
+        assert ra.level == RiskLevel.MODERATE
+        assert not ra.is_interactive
+        ra2 = RiskAssessment(level=RiskLevel.HIGH, reasons=["interactive shell"])
+        assert ra2.is_interactive
+        print("  PASS: RiskAssessment model works")
+        print()
+
+        # ── 7.10 Env File Protection ──────────────────────────────────
+        print("=== Env File Protection ===")
+        assert _check_env_file_exposure("cat .env") == True
+        assert _check_env_file_exposure("cat .env.local") == True
+        assert _check_env_file_exposure("echo hello") == False
+        assert _check_env_file_exposure("cat /path/to/.env.production") == True
+        print("  PASS: Env file detection works")
+        print()
+
+        # ── 7.11 parse_cd_target ──────────────────────────────────────
+        print("=== parse_cd_target ===")
+        if IS_WINDOWS:
+            base = os.getcwd()
+            assert parse_cd_target("cd subdir", base) == os.path.join(base, "subdir")
+        else:
+            assert parse_cd_target("cd /tmp", "/home") == "/tmp"
+            assert parse_cd_target("cd subdir", "/home") == os.path.join(
+                "/home", "subdir"
+            )
+        assert parse_cd_target("cd && ls", os.getcwd()) is None
+        assert parse_cd_target("ls", os.getcwd()) is None
+        print("  PASS: parse_cd_target works")
+        print()
+
+        print("All built-in tests passed!")
+        _sys.exit(0)
