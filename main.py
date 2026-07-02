@@ -5,6 +5,7 @@ Interactive terminal agent with a robust bash execution harness.
 
 Key improvements over the original:
   • Single unified shell tool  (Python runs via python3 inside bash)
+  • Config-file-driven permission system (auto-creates defaults)
   • Risk-assessed permission gate with Allow-once / Session / Deny
   • Proper timeout handling (SIGTERM → SIGKILL)
   • 1 MB output cap with truncation notice
@@ -13,12 +14,10 @@ Key improvements over the original:
   • Interactive-command guard (vim, python REPL, ssh, etc. auto-rejected)
   • Structured output dict the LLM can reason about reliably
 
-Permission levels (configure via PermissionConfig):
-  SAFE     — auto-allow  (ls, cat, echo, grep, …)
-  MODERATE — ask user    (rm, mv, git push, pip install, …)
-  HIGH     — ask user    (sudo, dd, killall, force-push, …)
-  CRITICAL — ask user*   (rm -rf, curl|sh, fork bomb, mkfs, …)
-             *set deny_critical=True to auto-deny without asking
+Configuration:
+  Permissions are loaded from .local_executor/local_executor.json.
+  The config file is auto-created on first run with sensible defaults.
+  Edit the config file to customize permission rules.
 """
 
 from __future__ import annotations
@@ -54,7 +53,7 @@ os.environ["OTEL_INSTRUMENTATION_GENAI_CAPTURE_MESSAGE_CONTENT"] = "true"
 
 
 # ── Imports ───────────────────────────────────────────────────────────────────
-from local_executor import LocalExecutorToolkit, PermissionConfig, RiskLevel
+from local_executor import LocalExecutorToolkit
 from google.adk.agents.llm_agent import LlmAgent
 from google.adk.models.lite_llm import LiteLlm
 from google.adk.runners import InMemoryRunner
@@ -62,31 +61,13 @@ from google.genai import types
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-# PERMISSION CONFIG
-# ══════════════════════════════════════════════════════════════════════════════
-#
-# Adjust these to match your risk tolerance:
-#
-#   auto_approve=True           — never ask, allow everything  (CI/testing only)
-#   min_ask_level=MODERATE      — ask for MODERATE, HIGH, CRITICAL
-#   min_ask_level=HIGH          — silently allow MODERATE, only ask for HIGH+
-#   deny_critical=True          — auto-deny CRITICAL without asking
-#
-PERMISSION_CFG = PermissionConfig(
-    auto_approve=False,
-    min_ask_level=RiskLevel.MODERATE,
-    deny_critical=False,
-)
-
-
-# ══════════════════════════════════════════════════════════════════════════════
 # TOOLKIT SETUP
 # ══════════════════════════════════════════════════════════════════════════════
 
 toolkit = LocalExecutorToolkit(
-    workspace_dir=".",          # cwd of the agent session
-    permission_config=PERMISSION_CFG,
-    # shell=None,               # auto-detects: /bin/sh on POSIX, cmd.exe on Windows
+    workspace_dir=".",  # cwd of the agent session
+    # load_config_files=True,  # default: loads .local_executor/local_executor.json
+    # shell=None,              # auto-detects: /bin/sh on POSIX, cmd.exe on Windows
 )
 
 # Primary tool: handles ALL shell commands.
@@ -147,8 +128,10 @@ result tells you if this happened. Pipe through `head`, `tail`, or
 `grep` to get the relevant section.
 
 ## Permission denials
-If the user denies a command, do not retry it automatically.
-Explain what you were trying to do and ask the user for guidance.
+If a command is denied (exit_code=126), do NOT retry the exact same command.
+Instead, try a different approach: use a different command, a different tool,
+or a different way to achieve the same goal. If multiple approaches are all
+denied, then ask the user what they want to do.
 
 ## Rules
 - Always check `success` and `exit_code` in the result before proceeding.
@@ -166,6 +149,7 @@ Explain what you were trying to do and ask the user for guidance.
 # ══════════════════════════════════════════════════════════════════════════════
 # RUNNER
 # ══════════════════════════════════════════════════════════════════════════════
+
 
 async def _run_prompt(
     runner: InMemoryRunner,
@@ -207,13 +191,15 @@ async def _run_prompt(
 # MAIN
 # ══════════════════════════════════════════════════════════════════════════════
 
+
 async def main() -> None:
     app_name = "mercury_agent_cli"
-    user_id  = "user_1"
+    user_id = "user_1"
 
-    runner  = InMemoryRunner(agent=root_agent, app_name=app_name)
+    runner = InMemoryRunner(agent=root_agent, app_name=app_name)
     session = await runner.session_service.create_session(
-        app_name=app_name, user_id=user_id,
+        app_name=app_name,
+        user_id=user_id,
     )
 
     print("═" * 66)
@@ -221,8 +207,7 @@ async def main() -> None:
     print("═" * 66)
     print(f"  Workspace  : {toolkit.workspace_dir}")
     print(f"  Shell      : {toolkit._runner.shell}")
-    print(f"  Ask level  : {PERMISSION_CFG.min_ask_level.name}+")
-    print(f"  Auto-deny  : {'CRITICAL' if PERMISSION_CFG.deny_critical else 'off'}")
+    print(f"  Config     : loaded from .local_executor/local_executor.json")
     print("─" * 66)
     print("  Tools  : execute_shell_command  |  run_python_code")
     print("  Type 'exit' or 'quit' to stop.")
