@@ -15,11 +15,10 @@ Designed after OpenCode's bash tool architecture (packages/core/src/tool/bash.ts
       HIGH      → sudo, dd, passwd, killall, force-push
       MODERATE  → rm, mv, git push, pip/npm install
       SAFE      → everything else
-    Each risky command prompts the user:
-      [1] Allow this time
-      [2] Allow always for this session (exact command)
-      [3] Allow command (e.g. "rm") for entire session
-      [4] Deny
+    Risk levels are displayed as supplementary context in permission prompts.
+    Actual access control is driven by config-file rules (allow/ask/deny).
+    Config rules take precedence: a "cat *: allow" rule will auto-approve
+    "cat .env" even if the risk engine flags it as risky.
     Consecutive-denial detection: if the same exact command (or same base
     command) is denied twice, the 3rd attempt is auto-denied with a clear
     message. History is cleared after auto-deny so the 4th attempt prompts again.
@@ -93,7 +92,6 @@ TAIL_LINES: int = 250  # lines from end shown on success
 TAIL_LINES_ERROR: int = 280  # lines from end shown on failure (errors at bottom)
 HEAD_LINES_ERROR: int = 20  # lines from start shown on failure
 FORCE_KILL_DELAY_S: float = 3.0  # SIGTERM → SIGKILL grace period
-OUTPUT_DIR_NAME: str = "local_executor_outputs"  # temp dir under system temp
 OUTPUT_MAX_AGE_HOURS: int = 1  # auto-cleanup files older than this
 
 IS_WINDOWS: bool = platform.system() == "Windows"
@@ -284,8 +282,12 @@ SEP = "─" * 66
 
 
 def wildcard_match(pattern: str, value: str) -> bool:
-    """Match `value` against a shell-style `pattern` using fnmatch."""
-    return fnmatch.fnmatch(value, pattern)
+    """Match `value` against a shell-style `pattern` using fnmatch.
+
+    Normalizes to lowercase for consistent cross-platform behavior
+    (fnmatch.fnmatch is case-insensitive on Windows, case-sensitive on POSIX).
+    """
+    return fnmatch.fnmatch(value.lower(), pattern.lower())
 
 
 def _normalize_external_path(p: str) -> str:
@@ -314,7 +316,8 @@ def _normalize_external_path(p: str) -> str:
 
     try:
         system_temp = Path(tempfile.gettempdir()).resolve()
-        if str(resolved).startswith(str(system_temp)):
+        temp_prefix = str(system_temp) + os.sep
+        if str(resolved) == str(system_temp) or str(resolved).startswith(temp_prefix):
             remainder = str(resolved)[len(str(system_temp)) :]
             remainder = remainder.replace("\\", "/").lstrip("/")
             return f"/tmp/{remainder}" if remainder else "/tmp"
@@ -450,6 +453,7 @@ RISK_PATTERNS: List[Tuple[str, RiskLevel, str]] = [
 
 # Commands that block waiting for stdin — they'd hang until timeout.
 INTERACTIVE_PATTERNS: List[Tuple[str, str]] = [
+    (r"^python3?\s+-i\b", "interactive Python REPL (-i flag)"),
     (r"^python3?\s*$", "interactive Python REPL"),
     (r"^(i?python3?|bpython)\s*$", "interactive Python REPL"),
     (r"^(ba|z|fi|da|k)?sh\s*$", "interactive shell"),
@@ -458,7 +462,9 @@ INTERACTIVE_PATTERNS: List[Tuple[str, str]] = [
     (r"\bless\b|\bmore\b|\bman\b", "terminal pager"),
     (r"\btop\b|\bhtop\b|\bbtop\b|\bglances\b", "interactive system monitor"),
     (r"\bmysql\b|\bpsql\b|\bsqlite3\b", "interactive database REPL"),
+    (r"^node\s+--interactive\b", "interactive Node.js REPL (--interactive flag)"),
     (r"\bnode\s*$|\bts-node\s*$", "interactive Node.js REPL"),
+    (r"^ruby\s*$", "interactive Ruby REPL"),
     (r"\birb\s*$|\bpry\s*$", "interactive Ruby REPL"),
 ]
 
@@ -495,11 +501,32 @@ def is_interactive(command: str) -> Tuple[bool, str]:
 # ══════════════════════════════════════════════════════════════════════════════
 
 
+_output_dir: Optional[Path] = None
+_output_dir_lock = threading.Lock()
+
+
 def _get_output_dir() -> Path:
-    """Get or create the temp output directory for saving full command output."""
-    d = Path(tempfile.gettempdir()) / OUTPUT_DIR_NAME
-    d.mkdir(parents=True, exist_ok=True)
-    return d
+    """Get or create a secure temp output directory for saving full command output.
+
+    Uses tempfile.mkdtemp() for a unique, unpredictable directory name.
+    On POSIX, sets permissions to 0700 (owner-only access) to prevent
+    other users from reading command output that may contain secrets.
+    """
+    global _output_dir
+    with _output_dir_lock:
+        if _output_dir is not None and _output_dir.is_dir():
+            return _output_dir
+        base = Path(tempfile.gettempdir())
+        d = Path(tempfile.mkdtemp(prefix="local_executor_", dir=base))
+        if not IS_WINDOWS:
+            try:
+                import stat
+
+                d.chmod(stat.S_IRWXU)  # owner only: rwx------
+            except OSError:
+                pass
+        _output_dir = d
+        return d
 
 
 def _save_output_to_file(output: str, command: str) -> Optional[str]:
@@ -508,6 +535,8 @@ def _save_output_to_file(output: str, command: str) -> Optional[str]:
 
     Returns the file path string, or None on error.
     The agent can later read this file if it needs the preserved captured output.
+    On POSIX, files are created with 0600 permissions (owner read/write only)
+    to prevent other users from reading command output that may contain secrets.
     """
     try:
         cmd_hash = hashlib.sha1(command.encode()).hexdigest()[:6]
@@ -515,6 +544,13 @@ def _save_output_to_file(output: str, command: str) -> Optional[str]:
         filename = f"{ts}_{cmd_hash}.log"
         path = _get_output_dir() / filename
         path.write_text(output, encoding="utf-8", errors="replace")
+        if not IS_WINDOWS:
+            try:
+                import stat
+
+                path.chmod(stat.S_IRUSR | stat.S_IWUSR)  # owner read/write only
+            except OSError:
+                pass
         return str(path)
     except OSError:
         return None
@@ -572,6 +608,7 @@ def _format_truncation_suffix(
     total_lines: int,
     exit_code: Optional[int],
     output_file: Optional[str],
+    stderr_output_file: Optional[str] = None,
 ) -> str:
     """Format the metadata suffix appended to truncated output blocks."""
     suffix = ""
@@ -583,6 +620,8 @@ def _format_truncation_suffix(
         )
     if output_file:
         suffix += f"\n[full output saved to: {output_file}]"
+    if stderr_output_file:
+        suffix += f"\n[full stderr saved to: {stderr_output_file}]"
     return suffix
 
 
@@ -630,6 +669,19 @@ def _non_empty_strip(v: str) -> str:
     return v
 
 
+MAX_COMMAND_LENGTH: int = 100_000  # 100 KB — generous but prevents multi-MB abuse
+
+
+def _validate_command_length(v: str) -> str:
+    """AfterValidator: reject commands exceeding MAX_COMMAND_LENGTH."""
+    if len(v) > MAX_COMMAND_LENGTH:
+        raise ValueError(
+            f"Command too long ({len(v)} chars, max {MAX_COMMAND_LENGTH}). "
+            "Break into smaller commands or write to a script file."
+        )
+    return v
+
+
 class BashInput(BaseModel):
     """
     Input schema for the bash tool.
@@ -640,7 +692,11 @@ class BashInput(BaseModel):
       timeout : int?    — timeout in ms (default 120000, max 600000)
     """
 
-    command: Annotated[str, AfterValidator(_non_empty_strip)] = Field(
+    command: Annotated[
+        str,
+        AfterValidator(_non_empty_strip),
+        AfterValidator(_validate_command_length),
+    ] = Field(
         ...,
         description="Shell command string to execute. Supports full shell syntax: "
         "pipes, redirects, &&, ||, subshells, etc.",
@@ -670,6 +726,9 @@ class BashStructuredOutput(BaseModel):
       exit     : number?  — exit code (undefined on timeout)
       truncated: boolean  — was output truncated at 1 MB?
       timeout  : boolean? — did it time out?
+
+    TODO: Wire this into BashOutput as the compact metadata block instead of
+    embedding fields directly. Currently unused outside type declarations.
     """
 
     exit: Optional[int] = Field(
@@ -721,6 +780,10 @@ class BashOutput(BaseModel):
         default=None,
         description="Path to temp file containing the preserved captured output.",
     )
+    stderr_output_file: Optional[str] = Field(
+        default=None,
+        description="Path to temp file containing the preserved captured stderr (combine_output=False).",
+    )
     stdout: Optional[str] = Field(
         default=None,
         description="Stdout only (when combine_output=False). None if streams are merged.",
@@ -742,6 +805,9 @@ class BashOutput(BaseModel):
         """
         Convert to OpenCode's toModelOutput format.
 
+        TODO: Switch toolkit to use this method (matches OpenCode's exact format)
+        instead of to_adk_dict(). Currently unused — the toolkit uses to_adk_dict().
+
         Returns a list of text blocks:
           1. Raw command output (smart-truncated: head + tail)
           2. Summary line: "Command exited with code X." or "Command timed out."
@@ -761,8 +827,15 @@ class BashOutput(BaseModel):
         truncated_text, was_truncated, total_lines = _smart_truncate(
             visible_output or "(no output)", self.exit
         )
+        # OR line-count truncation with byte-cap truncation so the agent
+        # is never told "not truncated" when data was silently cut at 1 MB.
+        was_truncated = was_truncated or self.truncated
         truncated_text += _format_truncation_suffix(
-            was_truncated, total_lines, self.exit, self.output_file
+            was_truncated,
+            total_lines,
+            self.exit,
+            self.output_file,
+            stderr_output_file=self.stderr_output_file,
         )
         parts.append({"type": "text", "text": truncated_text})
 
@@ -792,8 +865,17 @@ class BashOutput(BaseModel):
         truncated_output, was_truncated, total_lines = _smart_truncate(
             visible_output or "(no output)", self.exit
         )
+        # OR line-count truncation with byte-cap truncation so the agent
+        # is never told "not truncated" when data was silently cut at 1 MB.
+        line_truncated = was_truncated
+        capture_truncated = self.truncated
+        was_truncated = was_truncated or self.truncated
         truncated_output += _format_truncation_suffix(
-            was_truncated, total_lines, self.exit, self.output_file
+            was_truncated,
+            total_lines,
+            self.exit,
+            self.output_file,
+            stderr_output_file=self.stderr_output_file,
         )
 
         return {
@@ -803,10 +885,13 @@ class BashOutput(BaseModel):
             "success": self.exit is not None and self.exit == 0,
             "denied": self.denied,
             "truncated": was_truncated,
+            "capture_truncated": capture_truncated,
+            "line_truncated": line_truncated,
             "timed_out": self.timeout or False,
             "warnings": self.warnings,
             "summary": self._summary_line(),
             "output_file": self.output_file,
+            "stderr_output_file": self.stderr_output_file,
             "stdout": self.stdout,
             "stderr": self.stderr,
             "stderr_truncated": self.stderr_truncated,
@@ -844,19 +929,13 @@ class PermissionConfig(BaseModel):
     """
     Deprecated permission policy configuration.
 
-    Matches OpenCode's permission evaluation order:
-      1. Global deny list   → PermissionDeniedError immediately
-      2. auto_approve flag  → allow silently
-      3. Global allow list  → allow silently
-      4. Saved always-rules → allow or deny per saved preference
-      5. Default            → prompt the terminal user
+    DEPRECATED: Use LocalExecutorConfig instead.
 
-    Simplified for the local harness:
-      auto_approve    — skip all prompts (testing/CI)
-      min_ask_level   — commands below this risk level are auto-allowed
-      deny_critical   — CRITICAL commands auto-denied without asking
-      allowed_actions — actions always allowed (e.g. ["python_executor"])
-      denied_actions  — actions always denied (e.g. ["bash"])
+    Only auto_approve is read by _convert_permission_config().
+    The following fields are DEFINED but SILENTLY IGNORED:
+      min_ask_level — has no effect (risk level does not gate access)
+      deny_critical — has no effect (config rules are the authority)
+      allowed_actions, denied_actions — has no effect (unused)
     """
 
     auto_approve: bool = Field(
@@ -902,6 +981,7 @@ class CommandResult:
     warnings: List[str] = field(default_factory=list)
     denied: bool = False
     output_file: Optional[str] = None
+    stderr_output_file: Optional[str] = None  # stderr file path (combine_output=False)
     stdout: Optional[str] = None  # stdout only (when combine_output=False)
     stderr: Optional[str] = None  # stderr only (when combine_output=False)
     stderr_truncated: bool = (
@@ -917,6 +997,7 @@ class CommandResult:
             output=self.output,
             warnings=self.warnings,
             output_file=self.output_file,
+            stderr_output_file=self.stderr_output_file,
             stdout=self.stdout,
             stderr=self.stderr,
             stderr_truncated=self.stderr_truncated,
@@ -1281,7 +1362,8 @@ class PermissionManager:
         DENY          — user said no; execution blocked
 
     Config-driven: uses LocalExecutorConfig rules (last-match-wins via fnmatch).
-    Risk level is shown as supplementary info in the prompt, not used for blocking.
+    Risk level (RiskLevel) is shown as supplementary info in the prompt but does
+    not independently gate access — config rules are the authority.
     """
 
     def __init__(
@@ -1311,6 +1393,7 @@ class PermissionManager:
         self._denial_history: List[Tuple[str, str]] = []
         self._pending_prompts: Dict[str, _PendingPermissionPrompt] = {}
         self._lock = threading.Lock()
+        self._last_denial_message: Optional[str] = None
 
     @staticmethod
     def _convert_permission_config(pc: PermissionConfig) -> LocalExecutorConfig:
@@ -1422,15 +1505,39 @@ class PermissionManager:
         if config_action == "deny":
             return PermissionDecision.DENY
 
+        # Check session cache — exact match OR child of a session-allowed parent.
+        # Path resolution strips trailing slashes (/a/ -> D:/a), so startswith
+        # can falsely match /a-other as a child of /a. Guard by checking the
+        # next character is a path separator.
+        resolved = _normalize_external_path(directory)
+        with self._lock:
+            for allowed in self._session_ext_allows:
+                if resolved == allowed:
+                    return PermissionDecision.ALLOW_ONCE
+                if (
+                    resolved.startswith(allowed)
+                    and resolved[len(allowed) : len(allowed) + 1] == "/"
+                ):
+                    return PermissionDecision.ALLOW_ONCE
+
+        # non_interactive -> deny (only after config + session checks)
+        if self._config.non_interactive:
+            return PermissionDecision.DENY
+        if config_action == "deny":
+            return PermissionDecision.DENY
+
         # non_interactive → deny
         if self._config.non_interactive:
             return PermissionDecision.DENY
 
-        # Check session cache
+        # Check session cache — exact match OR child of a session-allowed parent.
+        # _normalize_external_path returns trailing / for dirs (e.g. "C:/a/"),
+        # so resolved.startswith(allowed) correctly matches /a/sub as child of /a/.
         resolved = _normalize_external_path(directory)
         with self._lock:
-            if resolved in self._session_ext_allows:
-                return PermissionDecision.ALLOW_ONCE
+            for allowed in self._session_ext_allows:
+                if resolved == allowed or resolved.startswith(allowed):
+                    return PermissionDecision.ALLOW_ONCE
 
         truncated_dir = directory if len(directory) <= 72 else directory[:69] + "..."
 
@@ -1442,9 +1549,7 @@ class PermissionManager:
         print(f"  {BOLD}Warning   :{RESET} This path is OUTSIDE the workspace.")
         print(SEP)
         print(f"  {BOLD}[1]{RESET}  Allow this time")
-        print(
-            f"  {BOLD}[2]{RESET}  Allow for session (all commands referencing this dir)"
-        )
+        print(f"  {BOLD}[2]{RESET}  Allow for session (this dir + all subdirectories)")
         print(f"  {BOLD}[3]{RESET}  Deny")
         print(SEP)
 
@@ -1483,22 +1588,29 @@ class PermissionManager:
         Return a human-readable denial message for the given command.
         Used by execute_shell_command to craft a clear response for the LLM.
         """
+        # Check stash first — populated by _check_consecutive_denials before
+        # clearing history, so the specific message reaches the agent.
         with self._lock:
+            if self._last_denial_message:
+                msg = self._last_denial_message
+                self._last_denial_message = None  # consume once
+                return msg
             history = list(self._denial_history)
-        base = _extract_command_base(command)
 
         threshold = self._config.consecutive_deny_threshold
-        exact_count = sum(1 for d in history if d[0] == command)
-        base_count = sum(1 for d in history if d[1] == base)
 
-        if exact_count >= threshold:
+        # Count only CONSECUTIVE exact matches at the END of history
+        exact_consecutive = 0
+        for d in reversed(history):
+            if d[0] == command:
+                exact_consecutive += 1
+            else:
+                break
+
+        if exact_consecutive >= threshold:
             return (
-                f"Permission denied for this exact command ({exact_count} times). "
-                f"Try a different command or approach."
-            )
-        if base_count >= threshold:
-            return (
-                f"Permission denied for '{base}' commands ({base_count} times). "
+                f"Permission denied for this exact command "
+                f"({exact_consecutive} times). "
                 f"Try a different command or approach."
             )
         return "Permission denied by user. Try a different approach."
@@ -1521,11 +1633,12 @@ class PermissionManager:
 
     def _check_consecutive_denials(self, command: str) -> Optional[str]:
         """
-        If the last N denials were the same exact command, or the same base
-        command, auto-deny this attempt with an informative message.
+        If the last N denials were the same exact command string, auto-deny
+        this attempt with a specific message.
         Uses config.consecutive_deny_threshold (default 2).
 
-        Returns the denial message string, or None if no auto-deny.
+        NOTE: Only exact-command matching. Different commands (even same base
+        like 'rm file1' vs 'rm file2') never trigger auto-deny.
         After auto-deny, clears history so the next attempt prompts again.
         """
         threshold = self._config.consecutive_deny_threshold
@@ -1533,23 +1646,15 @@ class PermissionManager:
             if len(self._denial_history) < threshold:
                 return None
             last_n = self._denial_history[-threshold:]
-            base = _extract_command_base(command)
 
-            # Same exact command denied N times in a row
             if all(d[0] == command for d in last_n):
-                self._denial_history.clear()
-                return (
+                msg = (
                     f"Auto-denied: this exact command was refused {threshold} times. "
                     f"Try a different command or approach."
                 )
-
-            # Same base command denied N times in a row (different exact commands)
-            if all(d[1] == base for d in last_n):
+                self._last_denial_message = msg
                 self._denial_history.clear()
-                return (
-                    f"Auto-denied: '{base}' commands were refused {threshold} times. "
-                    f"Try a different command or approach."
-                )
+                return msg
 
         return None
 
@@ -1684,9 +1789,17 @@ class CommandHandle:
         self._result_ready = threading.Event()
         self._result: Optional[CommandResult] = None
 
-    def cancel(self) -> None:
-        """Signal the running command to stop. Thread-safe."""
+    def cancel(self, wait: bool = False, timeout: float = 2.0) -> None:
+        """Signal the running command to stop. Thread-safe.
+
+        Args:
+            wait: If True, block until the command finishes and return partial output.
+                  If False (default), return immediately (existing behavior).
+            timeout: Maximum seconds to wait when wait=True.
+        """
         self._cancel_event.set()
+        if wait:
+            self._result_ready.wait(timeout=timeout)
 
     def wait(self, timeout: Optional[float] = None) -> Optional[CommandResult]:
         """Block until command finishes or timeout. Returns CommandResult or None."""
@@ -1727,7 +1840,11 @@ class DoomLoopDetector:
 
 
 class ConfigWatcher:
-    """Watches the project config file and triggers reload on change."""
+    """Watches the project config file and triggers reload on change.
+
+    TODO: Wire into LocalExecutorToolkit.__init__() for hot-reload support.
+    Currently unused — instantiated nowhere.
+    """
 
     def __init__(
         self,
@@ -2113,6 +2230,9 @@ class ProcessRunner:
         timeout_ms: int = DEFAULT_TIMEOUT_MS,
         combine_output: bool = True,
         on_output: Optional[Callable[[str], None]] = None,
+        # TODO: Wire on_output into execute_shell_command for live streaming
+        # (currently hardcoded to None in the toolkit). Would give long builds
+        # incremental progress display — a feature OpenCode also lacks.
         stdin: Optional[str] = None,
         handle: Optional[CommandHandle] = None,
     ) -> CommandResult:
@@ -2154,7 +2274,7 @@ class ProcessRunner:
             )
 
         # Advisory: external path warnings
-        warnings = [
+        ext_warnings = [
             f"References external path '{d}' — command runs with host filesystem access"
             for d in detect_external_paths(command, cwd)
         ]
@@ -2225,7 +2345,7 @@ class ProcessRunner:
                             f"Failed to start process with primary shell ({exc}) "
                             f"and cmd.exe fallback ({fallback_exc})"
                         ),
-                        warnings=warnings,
+                        warnings=ext_warnings,
                     )
             else:
                 return CommandResult(
@@ -2235,7 +2355,7 @@ class ProcessRunner:
                     truncated=False,
                     cwd=cwd,
                     output=f"Failed to start process: {exc}",
-                    warnings=warnings,
+                    warnings=ext_warnings,
                 )
 
         # Output collector (runs in background thread to prevent pipe blocking)
@@ -2393,13 +2513,18 @@ class ProcessRunner:
         # When combine_output=False, output is stdout only, stderr is separate
         output = stdout_str
 
-        # Save full output to temp file only when output would be truncated
+        # Save full output to temp file when truncation happened (line or byte cap)
         line_count = len(output.splitlines())
         output_file = (
             _save_output_to_file(output, command)
-            if line_count > MAX_OUTPUT_LINES
+            if line_count > MAX_OUTPUT_LINES or truncated
             else None
         )
+
+        # Save stderr separately when truncated (combine_output=False)
+        stderr_output_file: Optional[str] = None
+        if stderr_str is not None and stderr_truncated:
+            stderr_output_file = _save_output_to_file(stderr_str, command)
 
         result = CommandResult(
             command=command,
@@ -2408,8 +2533,9 @@ class ProcessRunner:
             truncated=truncated,
             timed_out=timed_out,
             cwd=cwd,
-            warnings=warnings,
+            warnings=ext_warnings,
             output_file=output_file,
+            stderr_output_file=stderr_output_file,
             stdout=stdout_str if not combine_output else None,
             stderr=stderr_str if not combine_output else None,
             stderr_truncated=stderr_truncated if not combine_output else False,
@@ -2753,8 +2879,6 @@ class LocalExecutorToolkit:
                 if ext_dir in checked_ext_dirs:
                     continue
                 checked_ext_dirs.add(ext_dir)
-                if len(checked_ext_dirs) > 3:
-                    break  # prompt for at most 3 distinct external dirs
 
                 ext_decision = permissions.request_external_directory(
                     ext_dir,
@@ -2842,6 +2966,8 @@ class LocalExecutorToolkit:
                             f"root '{self.workspace_dir}'.{RESET}"
                         )
 
+            # cwd_state update is safe because ADK calls tools sequentially.
+            # If concurrent tool calls are ever supported, this must be atomic.
             return result.to_dict()
 
         return execute_shell_command
