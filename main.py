@@ -4,7 +4,7 @@ Mercury Agent CLI — improved
 Interactive terminal agent with a robust bash execution harness.
 
 Key improvements over the original:
-  • Single unified shell tool  (Python runs via python3 inside bash)
+  • Single unified shell tool  (Python runs via python inside bash)
   • Config-file-driven permission system (auto-creates defaults)
   • Risk-assessed permission gate with Allow-once / Session / Deny
   • Proper timeout handling (SIGTERM → SIGKILL)
@@ -71,11 +71,11 @@ toolkit = LocalExecutorToolkit(
 )
 
 # Primary tool: handles ALL shell commands.
-# Python code → python3 -c "..." or run_python_code below.
+# Python code → python -c "..." or run_python_code below.
 execute_shell_command = toolkit.get_tool_function()
 
 # Optional convenience wrapper for multi-line Python scripts.
-# The agent can also just use execute_shell_command with python3 -c.
+# The agent can also just use execute_shell_command with python -c.
 run_python_code = toolkit.get_python_tool()
 
 
@@ -102,7 +102,7 @@ You are a helpful assistant with access to shell execution tools.
 Use this for all shell operations:
   • File operations:     ls, cat, cp, find, grep, sed, awk, …
   • Git:                 git status, git diff, git log --oneline, …
-  • Python:              python3 -c "print('hello')" or python3 script.py
+  • Python:              python -c "print('hello')" or python script.py
   • Package management:  pip install X, npm install, …
   • Build systems:       make, npm run build, cargo build, …
   • Data processing:     jq, curl (to get data), xargs, …

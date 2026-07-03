@@ -93,6 +93,11 @@ TAIL_LINES_ERROR: int = 280  # lines from end shown on failure (errors at bottom
 HEAD_LINES_ERROR: int = 20  # lines from start shown on failure
 FORCE_KILL_DELAY_S: float = 3.0  # SIGTERM → SIGKILL grace period
 OUTPUT_MAX_AGE_HOURS: int = 1  # auto-cleanup files older than this
+MAX_VISIBLE_CHARS: int = 100_000  # byte-level cap for LLM-facing output
+HEAD_CHARS: int = 2_000  # chars from start shown on success
+TAIL_CHARS: int = 8_000  # chars from end shown on success
+TAIL_CHARS_ERROR: int = 9_000  # chars from end shown on failure
+HEAD_CHARS_ERROR: int = 1_000  # chars from start shown on failure
 
 IS_WINDOWS: bool = platform.system() == "Windows"
 
@@ -556,33 +561,57 @@ def _save_output_to_file(output: str, command: str) -> Optional[str]:
         return None
 
 
-def _smart_truncate(output: str, exit_code: Optional[int]) -> Tuple[str, bool, int]:
+def _smart_truncate(
+    output: str, exit_code: Optional[int]
+) -> Tuple[str, bool, bool, int, int]:
     """
     Apply head+tail truncation to output.
 
-    Returns (truncated_text, was_truncated, total_lines).
-    - On success (exit_code == 0): HEAD_LINES from start + TAIL_LINES from end
-    - On failure (exit_code != 0): HEAD_LINES_ERROR from start + TAIL_LINES_ERROR from end
+    Returns (truncated_text, line_truncated, char_truncated, total_lines, total_chars).
+    - Line truncation: when total_lines > MAX_OUTPUT_LINES
+    - Char truncation: when total_chars > MAX_VISIBLE_CHARS (safety net for long lines/gigantic lines)
     """
-    lines = output.splitlines(keepends=True)
-    total = len(lines)
+    total_chars = len(output)
+    total_lines = output.count("\n") + 1
 
-    if total <= MAX_OUTPUT_LINES:
-        return output, False, total
+    if total_chars <= MAX_VISIBLE_CHARS and total_lines <= MAX_OUTPUT_LINES:
+        return output, False, False, total_lines, total_chars
 
     if exit_code is not None and exit_code != 0:
         head_n, tail_n = HEAD_LINES_ERROR, TAIL_LINES_ERROR
+        head_c, tail_c = HEAD_CHARS_ERROR, TAIL_CHARS_ERROR
     else:
         head_n, tail_n = HEAD_LINES, TAIL_LINES
+        head_c, tail_c = HEAD_CHARS, TAIL_CHARS
 
-    head = lines[:head_n]
-    tail = lines[-tail_n:]
-    omitted = total - head_n - tail_n
+    line_truncated = False
+    char_truncated = False
 
-    truncated = "".join(head)
-    truncated += f"\n... ({omitted} lines omitted) ...\n\n"
-    truncated += "".join(tail)
-    return truncated, True, total
+    # Step 1: Line cap (produces cleaner output when there are many small lines)
+    if total_lines > MAX_OUTPUT_LINES:
+        lines = output.splitlines(keepends=True)
+        head = lines[:head_n]
+        tail = lines[-tail_n:]
+        omitted = total_lines - head_n - tail_n
+        truncated = "".join(head)
+        truncated += f"\n... ({omitted} lines omitted) ...\n\n"
+        truncated += "".join(tail)
+        line_truncated = True
+    else:
+        truncated = output
+
+    # Step 2: Char cap — catches the case where a single line is 512 KB+
+    # (line truncation can't protect against this since it operates on whole lines)
+    if len(truncated) > MAX_VISIBLE_CHARS:
+        head = truncated[:head_c]
+        tail = truncated[-tail_c:]
+        omitted_chars = len(truncated) - head_c - tail_c
+        truncated = head
+        truncated += f"\n... ({omitted_chars} chars omitted) ...\n\n"
+        truncated += tail
+        char_truncated = True
+
+    return truncated, line_truncated, char_truncated, total_lines, total_chars
 
 
 def _cleanup_old_outputs() -> None:
@@ -597,10 +626,17 @@ def _cleanup_old_outputs() -> None:
 
 
 def _line_window(exit_code: Optional[int]) -> Tuple[int, int]:
-    """Return the head/tail window used for smart truncation formatting."""
+    """Return the head/tail line window used for smart truncation formatting."""
     if exit_code is not None and exit_code != 0:
         return HEAD_LINES_ERROR, TAIL_LINES_ERROR
     return HEAD_LINES, TAIL_LINES
+
+
+def _char_window(exit_code: Optional[int]) -> Tuple[int, int]:
+    """Return the head/tail char window used for smart truncation formatting."""
+    if exit_code is not None and exit_code != 0:
+        return HEAD_CHARS_ERROR, TAIL_CHARS_ERROR
+    return HEAD_CHARS, TAIL_CHARS
 
 
 def _format_truncation_suffix(
@@ -609,15 +645,25 @@ def _format_truncation_suffix(
     exit_code: Optional[int],
     output_file: Optional[str],
     stderr_output_file: Optional[str] = None,
+    char_truncated: bool = False,
+    total_chars: int = 0,
+    line_truncated: bool = False,
 ) -> str:
     """Format the metadata suffix appended to truncated output blocks."""
     suffix = ""
     if was_truncated:
-        head_n, tail_n = _line_window(exit_code)
-        suffix += (
-            f"\n[truncated: {total_lines} total lines, "
-            f"showing first {head_n} + last {tail_n}]"
-        )
+        if line_truncated:
+            head_n, tail_n = _line_window(exit_code)
+            suffix += (
+                f"\n[truncated: {total_lines} total lines, "
+                f"showing first {head_n} + last {tail_n}]"
+            )
+        if char_truncated:
+            head_c, tail_c = _char_window(exit_code)
+            suffix += (
+                f"\n[truncated: {total_chars} total chars, "
+                f"showing first {head_c} + last {tail_c} chars]"
+            )
     if output_file:
         suffix += f"\n[full output saved to: {output_file}]"
     if stderr_output_file:
@@ -631,15 +677,14 @@ def _compose_visible_output(
     stderr: Optional[str],
 ) -> str:
     """Build the text block shown to the model from merged or split streams."""
-    if output:
-        return output
-
-    parts: List[str] = []
-    if stdout:
-        parts.append(f"[stdout]\n{stdout}")
-    if stderr:
-        parts.append(f"[stderr]\n{stderr}")
-    return "\n\n".join(parts)
+    if stdout is not None or stderr is not None:
+        parts: List[str] = []
+        if stdout:
+            parts.append(f"[stdout]\n{stdout}")
+        if stderr:
+            parts.append(f"[stderr]\n{stderr}")
+        return "\n\n".join(parts)
+    return output or ""
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -824,19 +869,21 @@ class BashOutput(BaseModel):
 
         # Block 2: smart-truncated output
         visible_output = _compose_visible_output(self.output, self.stdout, self.stderr)
-        truncated_text, was_truncated, total_lines = _smart_truncate(
-            visible_output or "(no output)", self.exit
+        truncated_text, line_truncated, char_truncated, total_lines, total_chars = (
+            _smart_truncate(visible_output or "(no output)", self.exit)
         )
-        # OR line-count truncation with byte-cap truncation so the agent
-        # is never told "not truncated" when data was silently cut at 1 MB.
-        was_truncated = was_truncated or self.truncated
+        was_truncated = line_truncated or char_truncated or self.truncated
         truncated_text += _format_truncation_suffix(
             was_truncated,
             total_lines,
             self.exit,
             self.output_file,
             stderr_output_file=self.stderr_output_file,
+            char_truncated=char_truncated,
+            total_chars=total_chars,
+            line_truncated=line_truncated,
         )
+
         parts.append({"type": "text", "text": truncated_text})
 
         # Block 3: summary line
@@ -862,21 +909,35 @@ class BashOutput(BaseModel):
         (head+tail) to keep the LLM context manageable.
         """
         visible_output = _compose_visible_output(self.output, self.stdout, self.stderr)
-        truncated_output, was_truncated, total_lines = _smart_truncate(
-            visible_output or "(no output)", self.exit
+        truncated_output, line_truncated, char_truncated, total_lines, total_chars = (
+            _smart_truncate(visible_output or "(no output)", self.exit)
         )
-        # OR line-count truncation with byte-cap truncation so the agent
-        # is never told "not truncated" when data was silently cut at 1 MB.
-        line_truncated = was_truncated
         capture_truncated = self.truncated
-        was_truncated = was_truncated or self.truncated
+        was_truncated = line_truncated or char_truncated or self.truncated
         truncated_output += _format_truncation_suffix(
             was_truncated,
             total_lines,
             self.exit,
             self.output_file,
             stderr_output_file=self.stderr_output_file,
+            char_truncated=char_truncated,
+            total_chars=total_chars,
+            line_truncated=line_truncated,
         )
+
+        # When combine_output=False, the composed output already contains
+        # [stdout]/[stderr] labeled blocks. Don't duplicate stdout/stderr
+        # as separate dict fields — the ADK serializes ALL dict keys into
+        # the LLM conversation, and 3x duplication (output + stdout + stderr)
+        # causes rapid context overflow. The composed output is the authority.
+        if self.stdout is not None or self.stderr is not None:
+            # Separate-streams mode: output already has the composed version
+            dict_stdout = None
+            dict_stderr = None
+        else:
+            # Merged mode: no separate streams, so nothing to exclude
+            dict_stdout = None
+            dict_stderr = None
 
         return {
             "outcome": self._outcome().value,
@@ -887,13 +948,14 @@ class BashOutput(BaseModel):
             "truncated": was_truncated,
             "capture_truncated": capture_truncated,
             "line_truncated": line_truncated,
+            "char_truncated": char_truncated,
             "timed_out": self.timeout or False,
             "warnings": self.warnings,
             "summary": self._summary_line(),
             "output_file": self.output_file,
             "stderr_output_file": self.stderr_output_file,
-            "stdout": self.stdout,
-            "stderr": self.stderr,
+            "stdout": dict_stdout,
+            "stderr": dict_stderr,
             "stderr_truncated": self.stderr_truncated,
         }
 
@@ -994,7 +1056,7 @@ class CommandResult:
             exit=self.exit_code if not self.timed_out else None,
             truncated=self.truncated,
             timeout=self.timed_out if self.timed_out else None,
-            output=self.output,
+            output=self.output if self.stdout is None else "",
             warnings=self.warnings,
             output_file=self.output_file,
             stderr_output_file=self.stderr_output_file,
@@ -2722,6 +2784,7 @@ class LocalExecutorToolkit:
             workdir: Optional[str] = None,
             timeout_ms: int = DEFAULT_TIMEOUT_MS,
             stdin: Optional[str] = None,
+            combine_output: bool = True,
         ) -> dict:
             """Execute a shell command with permission checking and structured output.
 
@@ -2750,6 +2813,9 @@ class LocalExecutorToolkit:
                             value for long-running builds or downloads.
                 stdin:      Optional UTF-8 text piped to the command's stdin.
                             Useful for non-interactive tools that read from stdin.
+                combine_output: If True (default), merge stdout+stderr into a single
+                            output string. If False, capture them separately and
+                            label them as [stdout]/[stderr] in the output.
 
             Returns:
                 dict with:
@@ -2943,6 +3009,7 @@ class LocalExecutorToolkit:
                 command,
                 resolved_cwd,
                 timeout_ms,
+                combine_output=combine_output,
                 on_output=None,
                 stdin=stdin,
             )
