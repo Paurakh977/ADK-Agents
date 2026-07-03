@@ -55,6 +55,7 @@ os.environ["OTEL_INSTRUMENTATION_GENAI_CAPTURE_MESSAGE_CONTENT"] = "true"
 # ── Imports ───────────────────────────────────────────────────────────────────
 from local_executor import LocalExecutorToolkit
 from google.adk.agents.llm_agent import LlmAgent
+from google.adk.agents.run_config import RunConfig, StreamingMode
 from google.adk.models.lite_llm import LiteLlm
 from google.adk.runners import InMemoryRunner
 from google.genai import types
@@ -164,26 +165,35 @@ async def _run_prompt(
     )
 
     print(f"Agent: ", end="", flush=True)
-    saw_partial = False
+    saw_text = False
+    saw_partial_text = False
 
     async for event in runner.run_async(
         user_id=user_id,
         session_id=session_id,
         new_message=content,
+        run_config=RunConfig(streaming_mode=StreamingMode.SSE),
     ):
-        if not event.content or not event.content.parts:
+        if not event.content:
             continue
-        for part in event.content.parts:
-            text = getattr(part, "text", None)
-            if not text:
-                continue
-            if event.partial:
-                print(text, end="", flush=True)
-                saw_partial = True
-            elif not saw_partial:
-                print(text, end="", flush=True)
+        text = "".join(part.text for part in event.content.parts if part.text)
+        if not text:
+            continue
 
-    print()
+        if event.partial:
+            print(text, end="", flush=True)
+            saw_text = True
+            saw_partial_text = True
+            continue
+
+        if not saw_partial_text:
+            print(text, end="", flush=True)
+            saw_text = True
+
+    if saw_text:
+        print()
+    else:
+        print("(no text response)")
     print("─" * 66)
 
 
@@ -213,9 +223,12 @@ async def main() -> None:
     print("  Type 'exit' or 'quit' to stop.")
     print("─" * 66)
 
+    loop = asyncio.get_event_loop()
+
     while True:
         try:
-            prompt = input("\nYou: ").strip()
+            prompt = await loop.run_in_executor(None, input, "\nYou: ")
+            prompt = prompt.strip()
         except (EOFError, KeyboardInterrupt):
             print("\nGoodbye!")
             break

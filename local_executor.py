@@ -2434,28 +2434,24 @@ class ProcessRunner:
         def _reader() -> None:
             nonlocal total_in, truncated
             assert proc.stdout is not None
-            buffer = b""
             try:
-                while True:
-                    chunk = proc.stdout.read(16_384)
-                    if not chunk:
-                        if buffer and on_output:
-                            on_output(buffer.decode("utf-8", errors="replace"))
-                        break
+                for raw_line in iter(proc.stdout.readline, b""):
+                    decoded = raw_line.decode("utf-8", errors="replace")
                     remaining = MAX_CAPTURE_BYTES - total_in
                     if remaining > 0:
-                        keep = chunk if len(chunk) <= remaining else chunk[:remaining]
+                        keep = (
+                            raw_line
+                            if len(raw_line) <= remaining
+                            else raw_line[:remaining]
+                        )
                         chunks.append(keep)
                     else:
                         truncated = True
-                    total_in += len(chunk)
+                    total_in += len(raw_line)
                     if total_in > MAX_CAPTURE_BYTES:
                         truncated = True
                     if on_output:
-                        buffer += chunk
-                        while b"\n" in buffer:
-                            line, buffer = buffer.split(b"\n", 1)
-                            on_output(line.decode("utf-8", errors="replace") + "\n")
+                        on_output(decoded.rstrip("\r\n"))
             except Exception as exc:
                 log.warning("Output reader error: %s", exc)
             finally:
@@ -3005,14 +3001,22 @@ class LocalExecutorToolkit:
                 ).to_dict()
 
             # ── Execute ────────────────────────────────────────────────────
+            truncated_cmd = command[:80] + "..." if len(command) > 80 else command
+            print(f"\n  {DIM}── shell: {truncated_cmd} ──{RESET}")
+
             result = runner.run(
                 command,
                 resolved_cwd,
                 timeout_ms,
                 combine_output=combine_output,
-                on_output=None,
+                on_output=lambda line: print(f"  {DIM}| {line.rstrip()}{RESET}"),
                 stdin=stdin,
             )
+
+            exit_str = (
+                str(result.exit_code) if result.exit_code is not None else "timeout"
+            )
+            print(f"  {DIM}── exit: {exit_str} ──{RESET}")
 
             # ── Track cwd if this was a bare `cd` ─────────────────────────
             if result.exit_code == 0:
