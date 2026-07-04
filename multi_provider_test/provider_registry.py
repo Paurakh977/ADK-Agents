@@ -83,6 +83,15 @@ CREDENTIAL_SCHEMA: dict[str, list[dict[str, Any]]] = {
             "optional": True,
         },
     ],
+    "opencode": [
+        {"key": "api_key", "label": "API Key", "secret": True},
+        {
+            "key": "api_base",
+            "label": "API Base URL (default: https://opencode.ai/zen/v1)",
+            "secret": False,
+            "optional": True,
+        },
+    ],
 }
 
 # ---------------------------------------------------------------------------
@@ -119,6 +128,7 @@ OPENAI_COMPAT_PROVIDERS: set[str] = {
     "dinference",
     "cloudferro-sherlock",
     "clarifai",
+    "opencode",
 }
 
 # OpenAI-compat providers all need api_key + api_base

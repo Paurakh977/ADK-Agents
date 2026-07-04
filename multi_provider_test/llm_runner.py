@@ -121,7 +121,11 @@ def build_call_kwargs(
     elif is_openai_compat(provider_id):
         # OpenAI-compatible providers: use openai/ prefix + user-provided api_base
         kwargs["api_key"] = creds.get("api_key")
-        kwargs["api_base"] = creds.get("api_base")
+        api_base = creds.get("api_base")
+        # Default api_base for known OpenAI-compat providers
+        if not api_base and internal_id == "opencode":
+            api_base = "https://opencode.ai/zen/v1"
+        kwargs["api_base"] = api_base
         model_string = f"openai/{model_id}"
         kwargs["model"] = model_string
     else:
