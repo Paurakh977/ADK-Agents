@@ -6,6 +6,7 @@ single-user desktop TUI (like OpenCode itself) -- if you later turn this
 into a multi-user web backend, swap this module for a DB table keyed by
 user_id and encrypt values at rest; the rest of the app doesn't need to change.
 """
+
 from __future__ import annotations
 
 import json
@@ -58,3 +59,17 @@ def remove_provider(provider_id: str) -> None:
 
 def is_configured(provider_id: str) -> bool:
     return provider_id in _load()
+
+
+def is_oauth_provider(provider_id: str) -> bool:
+    """Check if a provider uses OAuth (has auth_type=oauth in creds)."""
+    creds = _load().get(provider_id)
+    return creds is not None and creds.get("auth_type") == "oauth"
+
+
+def get_copilot_token(provider_id: str) -> str | None:
+    """Get the stored Copilot API token for a provider."""
+    creds = _load().get(provider_id)
+    if creds and creds.get("auth_type") == "oauth":
+        return creds.get("copilot_token")
+    return None

@@ -24,6 +24,7 @@ from google.adk.runners import InMemoryRunner
 from google.genai import types
 
 from provider_registry import normalize_provider_id, is_openai_compat
+import credential_store
 
 logging.basicConfig(level=logging.WARNING)
 warnings.filterwarnings("ignore", category=UserWarning, module="pydantic")
@@ -118,6 +119,23 @@ def build_call_kwargs(
     elif internal_id == "ollama":
         if creds.get("api_base"):
             kwargs["api_base"] = creds["api_base"]
+    elif internal_id == "github-copilot":
+        # GitHub Copilot uses OAuth token, not API key
+        copilot_token = creds.get("copilot_token")
+        if not copilot_token:
+            copilot_token = credential_store.get_copilot_token("github-copilot")
+        kwargs["api_key"] = copilot_token
+        kwargs["api_base"] = "https://api.githubcopilot.com"
+        kwargs["extra_headers"] = {
+            "copilot-integration-id": "vscode-chat",
+            "editor-version": "vscode/1.95.0",
+            "editor-plugin-version": "copilot-chat/0.26.7",
+            "user-agent": "GitHubCopilotChat/0.26.7",
+            "openai-intent": "conversation-panel",
+            "x-github-api-version": "2025-04-01",
+        }
+        model_string = f"openai/{model_id}"
+        kwargs["model"] = model_string
     elif is_openai_compat(provider_id):
         # OpenAI-compatible providers: use openai/ prefix + user-provided api_base
         kwargs["api_key"] = creds.get("api_key")

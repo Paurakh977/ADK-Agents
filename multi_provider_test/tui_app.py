@@ -23,9 +23,12 @@ from textual.screen import ModalScreen
 from textual.widgets import Footer, Header, Input, Label, ListItem, ListView, RichLog
 
 import credential_store
+import github_copilot_oauth as copilot_oauth
 import llm_runner
 import provider_registry
 from provider_registry import normalize_provider_id
+
+OAUTH_PROVIDERS = {"github-copilot"}
 
 
 class ProviderPickerScreen(ModalScreen[str | None]):
@@ -80,6 +83,57 @@ class ProviderPickerScreen(ModalScreen[str | None]):
 
     def on_list_view_selected(self, event: ListView.Selected) -> None:
         self.dismiss(event.item.provider_id)  # type: ignore[attr-defined]
+
+
+class OAuthScreen(ModalScreen[dict[str, Any] | None]):
+    """Shows device code and waits for user to authorize via browser."""
+
+    DEFAULT_CSS = """
+    OAuthScreen { align: center middle; }
+    #dialog { width: 70; border: round $accent; background: $surface; padding: 1; }
+    """
+
+    def __init__(self, provider_name: str, flow_info: dict[str, Any]) -> None:
+        super().__init__()
+        self.provider_name = provider_name
+        self.flow_info = flow_info
+        self._poll_task = None
+
+    def compose(self) -> ComposeResult:
+        with Vertical(id="dialog"):
+            yield Label(f"Connect {self.provider_name} via OAuth")
+            yield Label("")
+            yield Label(f"1. Go to: [link]{self.flow_info['verification_uri']}[/link]")
+            yield Label(f"2. Enter code: [bold]{self.flow_info['user_code']}[/bold]")
+            yield Label("")
+            yield Label(
+                "[dim]Waiting for authorization... (esc to cancel)[/dim]", id="status"
+            )
+
+    def on_mount(self) -> None:
+        self._poll_task = self.run_worker(self._poll_for_auth(), exclusive=True)
+
+    async def _poll_for_auth(self) -> None:
+        try:
+            creds = await copilot_oauth.finish_copilot_auth(
+                self.flow_info["device_code"],
+                interval=self.flow_info.get("interval", 5),
+            )
+            self.dismiss(creds)
+        except copilot_oauth.CopilotAuthCancelled:
+            self.query_one("#status", Label).update(
+                "[red]Authorization cancelled.[/red]"
+            )
+            self.set_timer(1, self.dismiss)
+        except copilot_oauth.CopilotOAuthError as e:
+            self.query_one("#status", Label).update(f"[red]Error: {e}[/red]")
+            self.set_timer(2, self.dismiss)
+
+    def on_key(self, event) -> None:
+        if event.key == "escape":
+            if self._poll_task:
+                self._poll_task.cancel()
+            self.dismiss(None)
 
 
 class CredentialScreen(ModalScreen[dict[str, Any] | None]):
@@ -253,9 +307,34 @@ class ChatApp(App):
                     f"[green]Connected {name}.[/green]"
                 )
 
-            self.push_screen(CredentialScreen(provider_id, name), after_creds)
+            if internal_id in OAUTH_PROVIDERS:
+                self._start_oauth_flow(internal_id, name, after_creds)
+            else:
+                self.push_screen(CredentialScreen(provider_id, name), after_creds)
 
         self.push_screen(ProviderPickerScreen(providers), after_pick)
+
+    def _start_oauth_flow(
+        self, provider_id: str, provider_name: str, after_creds
+    ) -> None:
+        """Start OAuth device flow for providers like GitHub Copilot."""
+        log = self.query_one("#chatlog", RichLog)
+
+        async def _do_oauth_flow() -> None:
+            try:
+                flow_info = await copilot_oauth.complete_copilot_auth()
+
+                def on_oauth_done(creds: dict[str, Any] | None) -> None:
+                    if creds:
+                        after_creds(creds)
+                    else:
+                        log.write("[dim]OAuth cancelled.[/dim]")
+
+                self.push_screen(OAuthScreen(provider_name, flow_info), on_oauth_done)
+            except Exception as e:
+                log.write(f"[red]OAuth error: {e}[/red]")
+
+        self.run_worker(_do_oauth_flow(), exclusive=True)
 
     def action_select_model(self) -> None:
         if not self.registry:
